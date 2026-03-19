@@ -590,6 +590,28 @@ def split_tasks(tasks: List[RunFamilyTask], train_frac: float, val_frac: float, 
     return tr, va, te
 
 
+def filter_snapshots_in_families(
+    families: List[RunFamilyTask],
+    drop_snapnums: Optional[set[int]] = None,
+    keep_snapnums: Optional[set[int]] = None,
+    min_snapshots_per_family: int = 1,
+) -> List[RunFamilyTask]:
+    out: List[RunFamilyTask] = []
+    for fam in families:
+        snaps = fam.snapshots
+        if drop_snapnums:
+            snaps = [s for s in snaps if int(s.snapnum) not in drop_snapnums]
+        if keep_snapnums is not None:
+            snaps = [s for s in snaps if int(s.snapnum) in keep_snapnums]
+        if len(snaps) >= int(min_snapshots_per_family):
+            out.append(RunFamilyTask(run_id=fam.run_id, snapshots=snaps))
+    return out
+
+
+def count_snapshot_presence(families: List[RunFamilyTask], snapnum: int) -> int:
+    return int(sum(1 for fam in families for s in fam.snapshots if int(s.snapnum) == int(snapnum)))
+
+
 def compute_norm_stats(train_tasks: List[RunFamilyTask], eps: float = 1e-6):
     flat = flatten_family_tasks(train_tasks)
     x_stack = np.concatenate([t.x.reshape(-1, t.x.shape[-1]) for t in flat], axis=0)
@@ -634,7 +656,12 @@ def normalize_tasks(tasks: List[RunFamilyTask], stats) -> List[RunFamilyTask]:
     return out
 
 
-def anp_collate(batch, max_aux_snapshots: int = 2, aux_halo_frac: float = 0.5):
+def anp_collate(
+    batch,
+    max_aux_snapshots: int = 2,
+    aux_halo_frac: float = 0.5,
+    target_snapnum: Optional[int] = None,
+):
     ctx_x_list, ctx_y_list, tgt_x_list, tgt_y_list = [], [], [], []
     ctx_snap_list, tgt_snap_list = [], []
     ctx_mask_list, tgt_mask_list = [], []
@@ -645,7 +672,13 @@ def anp_collate(batch, max_aux_snapshots: int = 2, aux_halo_frac: float = 0.5):
         if len(snapshots) == 0:
             continue
 
-        tgt_task = snapshots[np.random.randint(0, len(snapshots))]
+        if target_snapnum is None:
+            tgt_task = snapshots[np.random.randint(0, len(snapshots))]
+        else:
+            candidates = [s for s in snapshots if int(s.snapnum) == int(target_snapnum)]
+            if len(candidates) == 0:
+                continue
+            tgt_task = candidates[np.random.randint(0, len(candidates))]
         aux_candidates = [s for s in snapshots if s.snap_idx != tgt_task.snap_idx]
 
         x = torch.tensor(tgt_task.x, dtype=torch.float32)
@@ -707,6 +740,12 @@ def anp_collate(batch, max_aux_snapshots: int = 2, aux_halo_frac: float = 0.5):
             "n_r": int(n_r),
             "n_c": int(n_c),
         })
+
+    if len(ctx_x_list) == 0:
+        raise RuntimeError(
+            "anp_collate produced an empty batch. "
+            "This can happen if target_snapnum is set but no families contain that snapshot."
+        )
 
     def pad_2d(seq, pad_val=0.0):
         b = len(seq)
@@ -1896,6 +1935,17 @@ def make_arg_parser():
         default=0.1,
         help="Strength of learned snapshot-time modulation in model feature space.",
     )
+    p.add_argument(
+        "--temporal-holdout-snapnum",
+        type=int,
+        default=-1,
+        help="If >=0, exclude this snapshot from training/validation and report a dedicated holdout evaluation.",
+    )
+    p.add_argument(
+        "--temporal-holdout-require-context",
+        action="store_true",
+        help="Require at least one non-holdout snapshot in a family for temporal holdout evaluation.",
+    )
 
     p.add_argument("--disable-mean-prior", action="store_true")
     p.add_argument("--mean-hidden-dim", type=int, default=128)
@@ -1993,6 +2043,47 @@ def main():
         raise RuntimeError(f"Too few run families discovered ({len(tasks)}). Check file paths and filters.")
 
     train_raw, val_raw, test_raw = split_tasks(tasks, train_frac=args.train_frac, val_frac=args.val_frac, seed=args.seed)
+    holdout_snap = int(args.temporal_holdout_snapnum)
+    temporal_holdout_enabled = holdout_snap >= 0
+    holdout_eval_raw: Optional[List[RunFamilyTask]] = None
+
+    if temporal_holdout_enabled:
+        if holdout_snap not in set(int(s) for s in args.resolved_snapnums):
+            raise ValueError(
+                f"temporal-holdout-snapnum={holdout_snap} not in configured --snapnums={args.resolved_snapnums}"
+            )
+
+        holdout_eval_raw = filter_snapshots_in_families(
+            test_raw,
+            keep_snapnums={holdout_snap},
+            min_snapshots_per_family=1,
+        )
+        if args.temporal_holdout_require_context:
+            holdout_eval_raw = [
+                fam for fam in test_raw
+                if any(int(s.snapnum) == holdout_snap for s in fam.snapshots)
+                and any(int(s.snapnum) != holdout_snap for s in fam.snapshots)
+            ]
+
+        train_raw = filter_snapshots_in_families(
+            train_raw,
+            drop_snapnums={holdout_snap},
+            min_snapshots_per_family=1,
+        )
+        val_raw = filter_snapshots_in_families(
+            val_raw,
+            drop_snapnums={holdout_snap},
+            min_snapshots_per_family=1,
+        )
+        test_raw = filter_snapshots_in_families(
+            test_raw,
+            drop_snapnums={holdout_snap},
+            min_snapshots_per_family=1,
+        )
+
+        if len(train_raw) == 0:
+            raise RuntimeError("Temporal holdout removed all training families; reduce holdout strictness or increase data.")
+
     if main_proc:
         n_tr_snap = sum(len(f.snapshots) for f in train_raw)
         n_va_snap = sum(len(f.snapshots) for f in val_raw)
@@ -2001,6 +2092,14 @@ def main():
             f"Split sizes (families) train={len(train_raw)}, val={len(val_raw)}, test={len(test_raw)} | "
             f"snapshots train={n_tr_snap}, val={n_va_snap}, test={n_te_snap}"
         )
+        if temporal_holdout_enabled:
+            n_hold = 0 if holdout_eval_raw is None else sum(
+                1 for fam in holdout_eval_raw for s in fam.snapshots if int(s.snapnum) == holdout_snap
+            )
+            print(
+                f"Temporal holdout enabled for snap {holdout_snap}: "
+                f"removed from train/val/test, holdout eval targets={n_hold} snapshots"
+            )
 
     y_dim = train_raw[0].snapshots[0].y.shape[-1]
     mean_model: Optional[MeanModel] = MeanModel(y_dim=y_dim, hidden_dim=args.mean_hidden_dim).to(device)
@@ -2062,11 +2161,19 @@ def main():
     train_ds = CAMELSRunFamilyDataset(train_tasks)
     val_ds = CAMELSRunFamilyDataset(val_tasks)
     test_ds = CAMELSRunFamilyDataset(test_tasks)
+    holdout_test_tasks = normalize_tasks(holdout_eval_raw, norm_np) if holdout_eval_raw is not None else None
+    holdout_test_ds = CAMELSRunFamilyDataset(holdout_test_tasks) if holdout_test_tasks is not None else None
 
     collate_fn = functools.partial(
         anp_collate,
         max_aux_snapshots=int(args.max_aux_snapshots),
         aux_halo_frac=float(args.aux_halo_frac),
+    )
+    holdout_collate_fn = functools.partial(
+        anp_collate,
+        max_aux_snapshots=int(args.max_aux_snapshots),
+        aux_halo_frac=float(args.aux_halo_frac),
+        target_snapnum=(None if not temporal_holdout_enabled else holdout_snap),
     )
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if ddp_enabled else None
@@ -2377,6 +2484,18 @@ def main():
             drop_last=False,
         )
 
+        holdout_loader_eval = None
+        if temporal_holdout_enabled and holdout_test_ds is not None and len(holdout_test_ds) > 0:
+            holdout_loader_eval = DataLoader(
+                holdout_test_ds,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=(device.type == "cuda"),
+                collate_fn=holdout_collate_fn,
+                drop_last=False,
+            )
+
         test_metrics = evaluate_test_metrics(
             eval_model,
             test_loader_eval,
@@ -2440,6 +2559,24 @@ def main():
         print("Few-shot RMSE:", fshot)
         print("Few-shot relative improvement (%):", rel)
 
+        temporal_holdout_metrics = None
+        if holdout_loader_eval is not None:
+            temporal_holdout_metrics = evaluate_test_metrics(
+                eval_model,
+                holdout_loader_eval,
+                device,
+                y_mean=y_mean,
+                y_std=y_std,
+                x_mean=x_mean,
+                x_std=x_std,
+                mean_model=mean_model,
+                n_samples=args.eval_samples,
+                target_names=target_names,
+                core_radius_frac=float(args.core_radius_frac),
+                core_radius_min_bins=int(args.core_radius_min_bins),
+            )
+            print(f"Temporal holdout (snap={holdout_snap}) metrics:", temporal_holdout_metrics)
+
         ckpt_path = out_dir / "best_model.pt"
         torch.save(
             {
@@ -2464,6 +2601,17 @@ def main():
             "n_train_snapshots": int(sum(len(f.snapshots) for f in train_tasks)),
             "n_val_snapshots": int(sum(len(f.snapshots) for f in val_tasks)),
             "n_test_snapshots": int(sum(len(f.snapshots) for f in test_tasks)),
+            "temporal_holdout": {
+                "enabled": bool(temporal_holdout_enabled),
+                "snapnum": int(holdout_snap) if temporal_holdout_enabled else None,
+                "require_context": bool(args.temporal_holdout_require_context),
+                "n_holdout_target_snapshots": (
+                    0
+                    if holdout_eval_raw is None
+                    else int(sum(1 for fam in holdout_eval_raw for s in fam.snapshots if int(s.snapnum) == holdout_snap))
+                ),
+                "metrics": temporal_holdout_metrics,
+            },
             "select_metric": select_metric,
             "best_epoch": best["epoch"],
             "best_score": best["score"],
