@@ -50,6 +50,14 @@ class Emulator:
         self.theta_dim = int(args.get("theta_dim", 35))
         self.theta_start_idx = int(args.get("theta_start_idx", 2))
         self.raw_x_dim = int(x_mean.shape[0])
+        snapnums_cfg = args.get("resolved_snapnums", None)
+        if snapnums_cfg is None:
+            snapnum_legacy = int(args.get("snapnum", 90))
+            self.snapnums = [snapnum_legacy]
+        else:
+            self.snapnums = [int(s) for s in snapnums_cfg]
+        self.snap_to_idx = {int(s): i for i, s in enumerate(self.snapnums)}
+        self.default_snapnum = int(self.snapnums[0])
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str | Path, device: str = "cpu") -> "Emulator":
@@ -165,6 +173,8 @@ class Emulator:
                     channel_balance_loss=bool(args.get("channel_balance_loss", False)),
                     channel_balance_alpha=float(args.get("channel_balance_alpha", 1.0)),
                     channel_balance_eps=float(args.get("channel_balance_eps", 1e-6)),
+                    num_snapshots=max(1, len(args.get("resolved_snapnums", [args.get("snapnum", 90)]))),
+                    time_feature_scale=float(args.get("time_feature_scale", 0.1)),
                 )
                 candidate_model.load_state_dict(model_state)
                 candidate_model.eval()
@@ -243,9 +253,10 @@ class Emulator:
         M: np.ndarray,
         r_bins: RadialBinsArg,
         field: FieldArg,
+        snapnum: int | None = None,
         n_samples: int = 30,
     ) -> PredictionResult:
-        batch, n_halo, n_r = self._build_zeroshot_batch(theta=theta, masses=M, r_bins=r_bins)
+        batch, n_halo, n_r = self._build_zeroshot_batch(theta=theta, masses=M, r_bins=r_bins, snapnum=snapnum)
 
         with torch.no_grad():
             mu, total_std, aleatoric_std, epistemic_std = self.model.predict(batch, device=self.device, n_samples=n_samples)
@@ -331,7 +342,7 @@ class Emulator:
 
         return out_idx, requested, single
 
-    def _build_zeroshot_batch(self, theta: np.ndarray, masses: np.ndarray, r_bins: RadialBinsArg):
+    def _build_zeroshot_batch(self, theta: np.ndarray, masses: np.ndarray, r_bins: RadialBinsArg, snapnum: int | None = None):
         masses = np.asarray(masses, dtype=np.float32)
         theta = np.asarray(theta, dtype=np.float32)
 
@@ -367,6 +378,13 @@ class Emulator:
 
         n_r = int(r_bins_use.shape[1])
 
+        chosen_snap = int(self.default_snapnum if snapnum is None else snapnum)
+        if chosen_snap not in self.snap_to_idx:
+            raise ValueError(
+                f"Unknown snapnum {chosen_snap}. Available snapshots in this checkpoint: {self.snapnums}"
+            )
+        snap_idx = int(self.snap_to_idx[chosen_snap])
+
         if theta.ndim == 1:
             if theta.shape[0] != self.theta_dim:
                 raise ValueError(f"theta must have length {self.theta_dim}, got {theta.shape[0]}")
@@ -393,21 +411,25 @@ class Emulator:
 
         tgt_x = torch.tensor(x_norm, dtype=torch.float32)
         tgt_mask = torch.ones((1, n_halo * n_r), dtype=torch.bool)
+        tgt_snap = torch.full((1, n_halo * n_r), int(snap_idx), dtype=torch.long)
 
         # Use a neutral zero-shot context token so we do not leak any target x
         # back into the context path. Keep it unmasked to avoid all-masked
         # attention edge cases in the current model implementation.
         ctx_x = torch.zeros((1, 1, self.raw_x_dim), dtype=torch.float32)
         ctx_mask = torch.ones((1, 1), dtype=torch.bool)
+        ctx_snap = torch.full((1, 1), int(snap_idx), dtype=torch.long)
 
         y_dim = len(self.target_names)
         batch = {
             "ctx_x": ctx_x,
             "ctx_y": torch.zeros((1, 1, y_dim), dtype=torch.float32),
+            "ctx_snap": ctx_snap,
             "tgt_x": tgt_x,
             "tgt_y": torch.zeros((1, n_halo * n_r, y_dim), dtype=torch.float32),
+            "tgt_snap": tgt_snap,
             "ctx_mask": ctx_mask,
             "tgt_mask": tgt_mask,
-            "meta": [{"run_id": -1, "n_halo": n_halo, "n_r": n_r, "n_c": 1}],
+            "meta": [{"run_id": -1, "snapnum": chosen_snap, "snap_idx": snap_idx, "n_halo": n_halo, "n_r": n_r, "n_c": 1}],
         }
         return batch, n_halo, n_r

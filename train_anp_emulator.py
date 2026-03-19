@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import functools
 import json
 import math
 import os
@@ -168,22 +169,63 @@ def set_seed(seed: int) -> None:
 @dataclass
 class RunTask:
     run_id: int
+    snapnum: int
+    snap_idx: int
+    redshift: float
     x: np.ndarray
     y: np.ndarray
     n_halo: int
     n_r: int
 
 
-class CAMELSRunTaskDataset(Dataset):
-    def __init__(self, tasks: List[RunTask]):
-        self.tasks = tasks
+@dataclass
+class RunFamilyTask:
+    run_id: int
+    snapshots: List[RunTask]
+
+
+class CAMELSRunFamilyDataset(Dataset):
+    def __init__(self, families: List[RunFamilyTask]):
+        self.families = families
 
     def __len__(self) -> int:
-        return len(self.tasks)
+        return len(self.families)
 
-    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, int]:
-        t = self.tasks[idx]
-        return t.x, t.y, t.run_id
+    def __getitem__(self, idx: int) -> RunFamilyTask:
+        return self.families[idx]
+
+
+def flatten_family_tasks(families: List[RunFamilyTask]) -> List[RunTask]:
+    out: List[RunTask] = []
+    for fam in families:
+        out.extend(fam.snapshots)
+    return out
+
+
+def remap_flat_tasks_to_families(families: List[RunFamilyTask], flat_tasks: List[RunTask]) -> List[RunFamilyTask]:
+    out: List[RunFamilyTask] = []
+    k = 0
+    for fam in families:
+        n = len(fam.snapshots)
+        out.append(RunFamilyTask(run_id=fam.run_id, snapshots=flat_tasks[k : k + n]))
+        k += n
+    if k != len(flat_tasks):
+        raise ValueError(f"Flat/family remap size mismatch: consumed={k}, total_flat={len(flat_tasks)}")
+    return out
+
+
+def parse_snapshot_redshifts(mapping_text: str) -> Dict[int, float]:
+    out: Dict[int, float] = {}
+    chunks = [c.strip() for c in str(mapping_text).split(",") if c.strip()]
+    for chunk in chunks:
+        snap_str, sep, z_str = chunk.partition(":")
+        if sep == "":
+            raise ValueError(
+                "Invalid --snapshot-redshifts entry "
+                f"'{chunk}'. Expected format snap:z, e.g. '90:0,74:0.5'."
+            )
+        out[int(snap_str.strip())] = float(z_str.strip())
+    return out
 
 
 class MeanModel(nn.Module):
@@ -283,7 +325,18 @@ def apply_residual_prior(tasks: List[RunTask], mean_model: MeanModel, device: to
             preds.append(mean_model(xb[:, 0], xb[:, 1]).detach().cpu())
         mean_y = torch.cat(preds, dim=0).numpy().reshape(t.y.shape).astype(np.float32)
         y_resid = (t.y - mean_y).astype(np.float32)
-        out.append(RunTask(run_id=t.run_id, x=t.x, y=y_resid, n_halo=t.n_halo, n_r=t.n_r))
+        out.append(
+            RunTask(
+                run_id=t.run_id,
+                snapnum=t.snapnum,
+                snap_idx=t.snap_idx,
+                redshift=t.redshift,
+                x=t.x,
+                y=y_resid,
+                n_halo=t.n_halo,
+                n_r=t.n_r,
+            )
+        )
     return out
 
 
@@ -406,71 +459,106 @@ def select_target(
     return target_map[target_name]
 
 
-def build_tasks(args) -> List[RunTask]:
+def build_tasks(args) -> List[RunFamilyTask]:
     mu_e = 2.0 / (1.0 + 0.76)
     mp = 1.67e-24
 
     base_path = Path(args.profiles_base)
     theta_by_run = load_theta_table(Path(args.param_csv), target_theta_dim=args.theta_dim)
-    runs = discover_runs(base_path, suite=args.suite, sim_set=args.sim_set, snapnum=args.snapnum)
-    if args.max_runs > 0:
-        runs = runs[: args.max_runs]
+    snapnums = list(args.resolved_snapnums)
+    snapnum_to_idx = {int(s): i for i, s in enumerate(snapnums)}
+    redshift_by_snap = dict(args.redshift_by_snap)
 
-    tasks: List[RunTask] = []
+    discovered_by_snap = {
+        int(s): discover_runs(base_path, suite=args.suite, sim_set=args.sim_set, snapnum=int(s))
+        for s in snapnums
+    }
+    candidate_runs = sorted(set().union(*[set(v) for v in discovered_by_snap.values()]))
+    if args.max_runs > 0:
+        candidate_runs = candidate_runs[: args.max_runs]
+
+    families: List[RunFamilyTask] = []
     skipped = 0
     skip_reasons = 0
 
-    for run in runs:
+    for run in candidate_runs:
         if run not in theta_by_run:
             skipped += 1
             continue
 
         try:
-            fpath = resolve_profile_file(run, base_path=base_path, suite=args.suite, sim_set=args.sim_set, snapnum=args.snapnum)
-            with np.load(fpath) as data:
-                m500c = data["M500c"].astype(np.float32)
-                r500c = data["R500c"].astype(np.float32)
-                r = data["radial_bins"].astype(np.float32)
-                y = select_target(
-                    data,
-                    target_name=args.target_name,
-                    mu_e=mu_e,
-                    mp=mp,
-                    eps=args.eps,
-                    all_profile_targets=getattr(args, "resolved_all_profile_targets", None),
+            snapshots: List[RunTask] = []
+            for snap in snapnums:
+                try:
+                    fpath = resolve_profile_file(
+                        run,
+                        base_path=base_path,
+                        suite=args.suite,
+                        sim_set=args.sim_set,
+                        snapnum=int(snap),
+                    )
+                except FileNotFoundError:
+                    continue
+
+                with np.load(fpath) as data:
+                    m500c = data["M500c"].astype(np.float32)
+                    r500c = data["R500c"].astype(np.float32)
+                    r = data["radial_bins"].astype(np.float32)
+                    y = select_target(
+                        data,
+                        target_name=args.target_name,
+                        mu_e=mu_e,
+                        mp=mp,
+                        eps=args.eps,
+                        all_profile_targets=getattr(args, "resolved_all_profile_targets", None),
+                    )
+
+                if y.ndim == 2:
+                    y = y[..., None]
+                if y.ndim != 3:
+                    raise ValueError(f"Expected target with ndim 2 or 3; got shape {y.shape}")
+
+                if args.radial_stride > 1:
+                    r = r[:: args.radial_stride]
+                    y = y[:, :: args.radial_stride, :]
+
+                if args.max_halos_per_run > 0 and m500c.shape[0] > args.max_halos_per_run:
+                    rng = np.random.default_rng(args.seed + run + int(snap))
+                    pick = np.sort(rng.choice(m500c.shape[0], size=args.max_halos_per_run, replace=False))
+                    m500c = m500c[pick]
+                    r500c = r500c[pick]
+                    y = y[pick]
+
+                n_halo, n_r, _ = y.shape
+                if n_halo < args.min_halos:
+                    continue
+
+                log_m = np.log10(np.clip(m500c, 1e10, None))[:, None]
+                r500_for_ratio = r500c * float(args.r500_physical_factor)
+                log_r_scaled = np.log10(np.clip(r[None, :] / r500_for_ratio[:, None], 1e-4, None))
+
+                x = np.zeros((n_halo, n_r, args.theta_start_idx + args.theta_dim), dtype=np.float32)
+                x[..., 0] = log_m
+                x[..., 1] = log_r_scaled
+                x[..., args.theta_start_idx : args.theta_start_idx + args.theta_dim] = theta_by_run[run][None, None, :]
+
+                snapshots.append(
+                    RunTask(
+                        run_id=run,
+                        snapnum=int(snap),
+                        snap_idx=int(snapnum_to_idx[int(snap)]),
+                        redshift=float(redshift_by_snap[int(snap)]),
+                        x=x,
+                        y=y.astype(np.float32),
+                        n_halo=n_halo,
+                        n_r=n_r,
+                    )
                 )
 
-            if y.ndim == 2:
-                y = y[..., None]
-            if y.ndim != 3:
-                raise ValueError(f"Expected target with ndim 2 or 3; got shape {y.shape}")
-
-            if args.radial_stride > 1:
-                r = r[:: args.radial_stride]
-                y = y[:, :: args.radial_stride, :]
-
-            if args.max_halos_per_run > 0 and m500c.shape[0] > args.max_halos_per_run:
-                rng = np.random.default_rng(args.seed + run)
-                pick = np.sort(rng.choice(m500c.shape[0], size=args.max_halos_per_run, replace=False))
-                m500c = m500c[pick]
-                r500c = r500c[pick]
-                y = y[pick]
-
-            n_halo, n_r, _ = y.shape
-            if n_halo < args.min_halos:
+            if len(snapshots) < int(args.min_snapshots_per_run):
                 skipped += 1
                 continue
-
-            log_m = np.log10(np.clip(m500c, 1e10, None))[:, None]
-            r500_for_ratio = r500c * float(args.r500_physical_factor)
-            log_r_scaled = np.log10(np.clip(r[None, :] / r500_for_ratio[:, None], 1e-4, None))
-
-            x = np.zeros((n_halo, n_r, args.theta_start_idx + args.theta_dim), dtype=np.float32)
-            x[..., 0] = log_m
-            x[..., 1] = log_r_scaled
-            x[..., args.theta_start_idx : args.theta_start_idx + args.theta_dim] = theta_by_run[run][None, None, :]
-
-            tasks.append(RunTask(run_id=run, x=x, y=y.astype(np.float32), n_halo=n_halo, n_r=n_r))
+            families.append(RunFamilyTask(run_id=run, snapshots=snapshots))
         except Exception as e:
             skipped += 1
             # Show a few concrete failure reasons to avoid silent all-run skips.
@@ -478,13 +566,20 @@ def build_tasks(args) -> List[RunTask]:
                 print(f"[build_tasks] Skipping run {run}: {type(e).__name__}: {e}")
                 skip_reasons += 1
 
-    print(f"Built {len(tasks)} tasks from {len(runs)} discovered runs (skipped {skipped}).")
-    if tasks:
-        print(f"Example task shape x={tasks[0].x.shape}, y={tasks[0].y.shape}")
-    return tasks
+    n_snapshots_total = sum(len(f.snapshots) for f in families)
+    print(
+        f"Built {len(families)} run families ({n_snapshots_total} snapshots) "
+        f"from {len(candidate_runs)} discovered runs (skipped {skipped})."
+    )
+    if families:
+        print(
+            f"Example family run_id={families[0].run_id}, snapshots={len(families[0].snapshots)}, "
+            f"x={families[0].snapshots[0].x.shape}, y={families[0].snapshots[0].y.shape}"
+        )
+    return families
 
 
-def split_tasks(tasks: List[RunTask], train_frac: float, val_frac: float, seed: int):
+def split_tasks(tasks: List[RunFamilyTask], train_frac: float, val_frac: float, seed: int):
     rng = np.random.default_rng(seed)
     idx = rng.permutation(len(tasks))
     n_train = int(len(tasks) * train_frac)
@@ -495,9 +590,10 @@ def split_tasks(tasks: List[RunTask], train_frac: float, val_frac: float, seed: 
     return tr, va, te
 
 
-def compute_norm_stats(train_tasks: List[RunTask], eps: float = 1e-6):
-    x_stack = np.concatenate([t.x.reshape(-1, t.x.shape[-1]) for t in train_tasks], axis=0)
-    y_stack = np.concatenate([t.y.reshape(-1, t.y.shape[-1]) for t in train_tasks], axis=0)
+def compute_norm_stats(train_tasks: List[RunFamilyTask], eps: float = 1e-6):
+    flat = flatten_family_tasks(train_tasks)
+    x_stack = np.concatenate([t.x.reshape(-1, t.x.shape[-1]) for t in flat], axis=0)
+    y_stack = np.concatenate([t.y.reshape(-1, t.y.shape[-1]) for t in flat], axis=0)
 
     x_mean = x_stack.mean(axis=0).astype(np.float32)
     x_std = x_stack.std(axis=0).astype(np.float32)
@@ -515,23 +611,45 @@ def compute_norm_stats(train_tasks: List[RunTask], eps: float = 1e-6):
     }
 
 
-def normalize_tasks(tasks: List[RunTask], stats) -> List[RunTask]:
-    out: List[RunTask] = []
-    for t in tasks:
-        x = ((t.x - stats["x_mean"][None, None, :]) / stats["x_std"][None, None, :]).astype(np.float32)
-        y = ((t.y - stats["y_mean"][None, None, :]) / stats["y_std"][None, None, :]).astype(np.float32)
-        out.append(RunTask(run_id=t.run_id, x=x, y=y, n_halo=t.n_halo, n_r=t.n_r))
+def normalize_tasks(tasks: List[RunFamilyTask], stats) -> List[RunFamilyTask]:
+    out: List[RunFamilyTask] = []
+    for fam in tasks:
+        snaps: List[RunTask] = []
+        for t in fam.snapshots:
+            x = ((t.x - stats["x_mean"][None, None, :]) / stats["x_std"][None, None, :]).astype(np.float32)
+            y = ((t.y - stats["y_mean"][None, None, :]) / stats["y_std"][None, None, :]).astype(np.float32)
+            snaps.append(
+                RunTask(
+                    run_id=t.run_id,
+                    snapnum=t.snapnum,
+                    snap_idx=t.snap_idx,
+                    redshift=t.redshift,
+                    x=x,
+                    y=y,
+                    n_halo=t.n_halo,
+                    n_r=t.n_r,
+                )
+            )
+        out.append(RunFamilyTask(run_id=fam.run_id, snapshots=snaps))
     return out
 
 
-def anp_collate(batch):
+def anp_collate(batch, max_aux_snapshots: int = 2, aux_halo_frac: float = 0.5):
     ctx_x_list, ctx_y_list, tgt_x_list, tgt_y_list = [], [], [], []
+    ctx_snap_list, tgt_snap_list = [], []
     ctx_mask_list, tgt_mask_list = [], []
     meta = []
 
-    for x_np, y_np, run_id in batch:
-        x = torch.tensor(x_np, dtype=torch.float32)
-        y = torch.tensor(y_np, dtype=torch.float32)
+    for fam in batch:
+        snapshots = fam.snapshots
+        if len(snapshots) == 0:
+            continue
+
+        tgt_task = snapshots[np.random.randint(0, len(snapshots))]
+        aux_candidates = [s for s in snapshots if s.snap_idx != tgt_task.snap_idx]
+
+        x = torch.tensor(tgt_task.x, dtype=torch.float32)
+        y = torch.tensor(tgt_task.y, dtype=torch.float32)
 
         n_halo, n_r, xdim = x.shape
         ydim = y.shape[-1]
@@ -544,18 +662,51 @@ def anp_collate(batch):
 
         ctx_x = x[ctx_h].reshape(-1, xdim)
         ctx_y = y[ctx_h].reshape(-1, ydim)
+        ctx_snap_chunks = [torch.full((ctx_x.shape[0],), int(tgt_task.snap_idx), dtype=torch.long)]
         tgt_x = x[tgt_h].reshape(-1, xdim)
         tgt_y = y[tgt_h].reshape(-1, ydim)
+
+        # Pull context from neighboring cosmic times for the same simulation.
+        if aux_candidates and max_aux_snapshots > 0:
+            n_aux = min(int(max_aux_snapshots), len(aux_candidates))
+            sel = np.random.choice(len(aux_candidates), size=n_aux, replace=False)
+            for j in sel:
+                aux_task = aux_candidates[int(j)]
+                x_aux = torch.tensor(aux_task.x, dtype=torch.float32)
+                y_aux = torch.tensor(aux_task.y, dtype=torch.float32)
+                n_halo_aux = int(x_aux.shape[0])
+                n_aux_halo = max(1, int(round(float(aux_halo_frac) * n_c)))
+                n_aux_halo = min(n_aux_halo, n_halo_aux)
+                perm_aux = torch.randperm(n_halo_aux)
+                pick_aux = perm_aux[:n_aux_halo]
+                x_aux_flat = x_aux[pick_aux].reshape(-1, xdim)
+                y_aux_flat = y_aux[pick_aux].reshape(-1, ydim)
+                ctx_x = torch.cat([ctx_x, x_aux_flat], dim=0)
+                ctx_y = torch.cat([ctx_y, y_aux_flat], dim=0)
+                ctx_snap_chunks.append(torch.full((x_aux_flat.shape[0],), int(aux_task.snap_idx), dtype=torch.long))
 
         ctx_x_list.append(ctx_x)
         ctx_y_list.append(ctx_y)
         tgt_x_list.append(tgt_x)
         tgt_y_list.append(tgt_y)
 
+        ctx_snap = torch.cat(ctx_snap_chunks, dim=0)
+        tgt_snap = torch.full((tgt_x.shape[0],), int(tgt_task.snap_idx), dtype=torch.long)
+        ctx_snap_list.append(ctx_snap)
+        tgt_snap_list.append(tgt_snap)
+
         ctx_mask_list.append(torch.ones(ctx_x.shape[0], dtype=torch.bool))
         tgt_mask_list.append(torch.ones(tgt_x.shape[0], dtype=torch.bool))
 
-        meta.append({"run_id": int(run_id), "n_halo": int(n_halo), "n_r": int(n_r), "n_c": int(n_c)})
+        meta.append({
+            "run_id": int(fam.run_id),
+            "snapnum": int(tgt_task.snapnum),
+            "snap_idx": int(tgt_task.snap_idx),
+            "redshift": float(tgt_task.redshift),
+            "n_halo": int(n_halo),
+            "n_r": int(n_r),
+            "n_c": int(n_c),
+        })
 
     def pad_2d(seq, pad_val=0.0):
         b = len(seq)
@@ -582,11 +733,21 @@ def anp_collate(batch):
             out[i, : t.shape[0]] = t
         return out
 
+    def pad_long(seq):
+        b = len(seq)
+        max_len = max(t.shape[0] for t in seq)
+        out = torch.zeros((b, max_len), dtype=torch.long)
+        for i, t in enumerate(seq):
+            out[i, : t.shape[0]] = t
+        return out
+
     return {
         "ctx_x": pad_2d(ctx_x_list),
         "ctx_y": pad_2d(ctx_y_list),
         "tgt_x": pad_2d(tgt_x_list),
         "tgt_y": pad_2d(tgt_y_list),
+        "ctx_snap": pad_long(ctx_snap_list),
+        "tgt_snap": pad_long(tgt_snap_list),
         "ctx_mask": pad_mask(ctx_mask_list),
         "tgt_mask": pad_mask(tgt_mask_list),
         "meta": meta,
@@ -793,6 +954,8 @@ class StrongANP(nn.Module):
         core_radius_weight: float = 1.0,
         core_radius_frac: float = 0.2,
         core_radius_min_bins: int = 3,
+        num_snapshots: int = 1,
+        time_feature_scale: float = 0.1,
     ):
         super().__init__()
 
@@ -859,6 +1022,18 @@ class StrongANP(nn.Module):
         else:
             self.log_sigma_task = None
 
+        self.num_snapshots = max(1, int(num_snapshots))
+        self.time_feature_scale = float(time_feature_scale)
+        self.time_embedding: Optional[nn.Embedding] = None
+        self.time_mlp: Optional[nn.Module] = None
+        if self.num_snapshots > 1:
+            self.time_embedding = nn.Embedding(self.num_snapshots, x_dim)
+            self.time_mlp = nn.Sequential(
+                nn.Linear(x_dim, x_dim),
+                nn.SiLU(),
+                nn.Linear(x_dim, x_dim),
+            )
+
     def _build_radius_weights(self, tgt_mask: torch.Tensor, meta: List[Dict]) -> torch.Tensor:
         # Emphasize inner radial bins where profile interiors are systematically harder.
         bsz, max_pts = tgt_mask.shape
@@ -900,6 +1075,14 @@ class StrongANP(nn.Module):
         if self.radius_fourier_include_raw_radius:
             return torch.cat([x_left, x_rad, x_rad_ff, x_right], dim=-1)
         return torch.cat([x_left, x_rad_ff, x_right], dim=-1)
+
+    def _fuse_time(self, x: torch.Tensor, snap_idx: torch.Tensor) -> torch.Tensor:
+        if self.time_embedding is None or self.time_mlp is None:
+            return x
+        snap_idx = torch.clamp(snap_idx.long(), min=0, max=self.num_snapshots - 1)
+        t = self.time_embedding(snap_idx)
+        dt = self.time_mlp(t)
+        return x + self.time_feature_scale * dt
 
     @staticmethod
     def _subsample_masked_points(x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor, max_points: int):
@@ -952,11 +1135,13 @@ class StrongANP(nn.Module):
         ctx_y = batch["ctx_y"].to(device)
         tgt_x_raw = batch["tgt_x"].to(device)
         tgt_y = batch["tgt_y"].to(device)
+        ctx_snap = batch["ctx_snap"].to(device)
+        tgt_snap = batch["tgt_snap"].to(device)
         ctx_mask = batch["ctx_mask"].to(device)
         tgt_mask = batch["tgt_mask"].to(device)
 
-        ctx_x = self._embed_x(ctx_x_raw)
-        tgt_x = self._embed_x(tgt_x_raw)
+        ctx_x = self._fuse_time(self._embed_x(ctx_x_raw), ctx_snap)
+        tgt_x = self._fuse_time(self._embed_x(tgt_x_raw), tgt_snap)
 
         q_ctx = self.latent(ctx_x, ctx_y, ctx_mask)
         lat_x, lat_y, lat_mask = self._subsample_masked_points(
@@ -1039,11 +1224,13 @@ class StrongANP(nn.Module):
         ctx_x_raw = batch["ctx_x"].to(device)
         ctx_y = batch["ctx_y"].to(device)
         tgt_x_raw = batch["tgt_x"].to(device)
+        ctx_snap = batch["ctx_snap"].to(device)
+        tgt_snap = batch["tgt_snap"].to(device)
         ctx_mask = batch["ctx_mask"].to(device)
         tgt_mask = batch["tgt_mask"].to(device)
 
-        ctx_x = self._embed_x(ctx_x_raw)
-        tgt_x = self._embed_x(tgt_x_raw)
+        ctx_x = self._fuse_time(self._embed_x(ctx_x_raw), ctx_snap)
+        tgt_x = self._fuse_time(self._embed_x(tgt_x_raw), tgt_snap)
 
         q_ctx = self.latent(ctx_x, ctx_y, ctx_mask)
         r = self.det(ctx_x, ctx_y, ctx_mask, tgt_x, tgt_mask)
@@ -1380,8 +1567,10 @@ def estimate_context_sensitivity(
         b0 = {
             "ctx_x": batch["ctx_x"],
             "ctx_y": torch.zeros_like(batch["ctx_y"]),
+            "ctx_snap": batch["ctx_snap"],
             "tgt_x": batch["tgt_x"],
             "tgt_y": batch["tgt_y"],
+            "tgt_snap": batch["tgt_snap"],
             "ctx_mask": batch["ctx_mask"],
             "tgt_mask": batch["tgt_mask"],
             "meta": batch["meta"],
@@ -1402,12 +1591,14 @@ def estimate_context_sensitivity(
 def set_context_halos_for_batch(batch, n_c: int):
     tgt_x = batch["tgt_x"]
     tgt_y = batch["tgt_y"]
+    tgt_snap = batch["tgt_snap"]
     tgt_mask = batch["tgt_mask"]
     meta = batch["meta"]
 
     bsz = tgt_x.shape[0]
     ctx_x = torch.zeros_like(tgt_x)
     ctx_y = torch.zeros_like(tgt_y)
+    ctx_snap = torch.zeros_like(tgt_snap)
     ctx_mask = torch.zeros_like(tgt_mask)
 
     for b in range(bsz):
@@ -1423,13 +1614,16 @@ def set_context_halos_for_batch(batch, n_c: int):
 
         ctx_x[b, : idx.numel()] = tgt_x[b, idx]
         ctx_y[b, : idx.numel()] = tgt_y[b, idx]
+        ctx_snap[b, : idx.numel()] = tgt_snap[b, idx]
         ctx_mask[b, : idx.numel()] = True
 
     return {
         "ctx_x": ctx_x,
         "ctx_y": ctx_y,
+        "ctx_snap": ctx_snap,
         "tgt_x": tgt_x,
         "tgt_y": tgt_y,
+        "tgt_snap": tgt_snap,
         "ctx_mask": ctx_mask,
         "tgt_mask": tgt_mask,
         "meta": meta,
@@ -1487,6 +1681,25 @@ def make_arg_parser():
     p.add_argument("--suite", type=str, default="IllustrisTNG")
     p.add_argument("--sim-set", type=str, default="SB35")
     p.add_argument("--snapnum", type=int, default=90)
+    p.add_argument(
+        "--snapnums",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional list of snapshots to use jointly. Defaults to [--snapnum].",
+    )
+    p.add_argument(
+        "--snapshot-redshifts",
+        type=str,
+        default="90:0.0,74:0.5,60:1.0,44:2.0",
+        help="Comma-separated map 'snap:z' used for metadata and temporal grouping.",
+    )
+    p.add_argument(
+        "--min-snapshots-per-run",
+        type=int,
+        default=1,
+        help="Minimum snapshots required for a run-family to be kept.",
+    )
     p.add_argument("--target-name", type=str, default="log_pressure", choices=TARGET_CHOICES)
     p.add_argument(
         "--all-profiles-subset",
@@ -1665,6 +1878,25 @@ def make_arg_parser():
     )
     p.add_argument("--save-every-epochs", type=int, default=20)
 
+    p.add_argument(
+        "--max-aux-snapshots",
+        type=int,
+        default=2,
+        help="Max number of auxiliary snapshots used as context for each training episode.",
+    )
+    p.add_argument(
+        "--aux-halo-frac",
+        type=float,
+        default=0.5,
+        help="Auxiliary-context halo count as fraction of target-context halo count.",
+    )
+    p.add_argument(
+        "--time-feature-scale",
+        type=float,
+        default=0.1,
+        help="Strength of learned snapshot-time modulation in model feature space.",
+    )
+
     p.add_argument("--disable-mean-prior", action="store_true")
     p.add_argument("--mean-hidden-dim", type=int, default=128)
     p.add_argument("--mean-epochs", type=int, default=80)
@@ -1708,6 +1940,18 @@ def main():
             raise ValueError("--all-profiles-subset is only valid when --target-name=all_profiles")
         target_names = [args.target_name]
     args.resolved_all_profile_targets = target_names
+    args.resolved_snapnums = list(args.snapnums) if args.snapnums else [int(args.snapnum)]
+    args.redshift_by_snap = parse_snapshot_redshifts(args.snapshot_redshifts)
+    missing_snap_map = [s for s in args.resolved_snapnums if int(s) not in args.redshift_by_snap]
+    if missing_snap_map:
+        raise ValueError(
+            "Missing redshift mapping for snapshots: "
+            f"{missing_snap_map}. Update --snapshot-redshifts."
+        )
+    if args.min_snapshots_per_run < 1:
+        raise ValueError("min_snapshots_per_run must be >= 1")
+    if len(args.resolved_snapnums) > 1 and args.min_snapshots_per_run < 2:
+        args.min_snapshots_per_run = 2
 
     if args.enable_ddp:
         ddp_enabled, rank, world_size, local_rank = setup_distributed(timeout_sec=int(args.ddp_timeout_sec))
@@ -1746,22 +1990,32 @@ def main():
 
     tasks = build_tasks(args)
     if len(tasks) < 20:
-        raise RuntimeError(f"Too few tasks discovered ({len(tasks)}). Check file paths and filters.")
+        raise RuntimeError(f"Too few run families discovered ({len(tasks)}). Check file paths and filters.")
 
     train_raw, val_raw, test_raw = split_tasks(tasks, train_frac=args.train_frac, val_frac=args.val_frac, seed=args.seed)
     if main_proc:
-        print(f"Split sizes train={len(train_raw)}, val={len(val_raw)}, test={len(test_raw)}")
+        n_tr_snap = sum(len(f.snapshots) for f in train_raw)
+        n_va_snap = sum(len(f.snapshots) for f in val_raw)
+        n_te_snap = sum(len(f.snapshots) for f in test_raw)
+        print(
+            f"Split sizes (families) train={len(train_raw)}, val={len(val_raw)}, test={len(test_raw)} | "
+            f"snapshots train={n_tr_snap}, val={n_va_snap}, test={n_te_snap}"
+        )
 
-    mean_model: Optional[MeanModel] = MeanModel(y_dim=tasks[0].y.shape[-1], hidden_dim=args.mean_hidden_dim).to(device)
+    y_dim = train_raw[0].snapshots[0].y.shape[-1]
+    mean_model: Optional[MeanModel] = MeanModel(y_dim=y_dim, hidden_dim=args.mean_hidden_dim).to(device)
     mean_prior_enabled = not args.disable_mean_prior
     if mean_prior_enabled:
         if main_proc:
             print("Pre-training frozen mean profile model for residual targets...")
+        train_raw_flat = flatten_family_tasks(train_raw)
+        val_raw_flat = flatten_family_tasks(val_raw)
+        test_raw_flat = flatten_family_tasks(test_raw)
         if ddp_enabled:
             if main_proc:
                 mean_model = train_mean_model(
-                    train_raw,
-                    y_dim=tasks[0].y.shape[-1],
+                    train_raw_flat,
+                    y_dim=y_dim,
                     args=args,
                     device=device,
                     verbose=True,
@@ -1775,16 +2029,19 @@ def main():
                 p.requires_grad_(False)
         else:
             mean_model = train_mean_model(
-                train_raw,
-                y_dim=tasks[0].y.shape[-1],
+                train_raw_flat,
+                y_dim=y_dim,
                 args=args,
                 device=device,
                 verbose=main_proc,
                 num_workers_override=None,
             )
-        train_raw = apply_residual_prior(train_raw, mean_model, device=device, batch_size=args.mean_predict_batch_size)
-        val_raw = apply_residual_prior(val_raw, mean_model, device=device, batch_size=args.mean_predict_batch_size)
-        test_raw = apply_residual_prior(test_raw, mean_model, device=device, batch_size=args.mean_predict_batch_size)
+        train_raw_flat = apply_residual_prior(train_raw_flat, mean_model, device=device, batch_size=args.mean_predict_batch_size)
+        val_raw_flat = apply_residual_prior(val_raw_flat, mean_model, device=device, batch_size=args.mean_predict_batch_size)
+        test_raw_flat = apply_residual_prior(test_raw_flat, mean_model, device=device, batch_size=args.mean_predict_batch_size)
+        train_raw = remap_flat_tasks_to_families(train_raw, train_raw_flat)
+        val_raw = remap_flat_tasks_to_families(val_raw, val_raw_flat)
+        test_raw = remap_flat_tasks_to_families(test_raw, test_raw_flat)
         if main_proc:
             print("Applied residual targets per split: y <- y - y_mean(logM, logr)")
     else:
@@ -1802,9 +2059,15 @@ def main():
     x_mean = torch.tensor(norm_np["x_mean"], dtype=torch.float32, device=device)
     x_std = torch.tensor(norm_np["x_std"], dtype=torch.float32, device=device)
 
-    train_ds = CAMELSRunTaskDataset(train_tasks)
-    val_ds = CAMELSRunTaskDataset(val_tasks)
-    test_ds = CAMELSRunTaskDataset(test_tasks)
+    train_ds = CAMELSRunFamilyDataset(train_tasks)
+    val_ds = CAMELSRunFamilyDataset(val_tasks)
+    test_ds = CAMELSRunFamilyDataset(test_tasks)
+
+    collate_fn = functools.partial(
+        anp_collate,
+        max_aux_snapshots=int(args.max_aux_snapshots),
+        aux_halo_frac=float(args.aux_halo_frac),
+    )
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if ddp_enabled else None
     val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False) if ddp_enabled else None
@@ -1819,7 +2082,7 @@ def main():
         sampler=train_sampler,
         num_workers=loader_workers,
         pin_memory=(device.type == "cuda"),
-        collate_fn=anp_collate,
+        collate_fn=collate_fn,
         drop_last=False,
     )
     val_loader = DataLoader(
@@ -1829,7 +2092,7 @@ def main():
         sampler=val_sampler,
         num_workers=loader_workers,
         pin_memory=(device.type == "cuda"),
-        collate_fn=anp_collate,
+        collate_fn=collate_fn,
         drop_last=False,
     )
     test_loader = DataLoader(
@@ -1839,11 +2102,11 @@ def main():
         sampler=test_sampler,
         num_workers=loader_workers,
         pin_memory=(device.type == "cuda"),
-        collate_fn=anp_collate,
+        collate_fn=collate_fn,
         drop_last=False,
     )
 
-    raw_x_dim = train_tasks[0].x.shape[-1]
+    raw_x_dim = train_tasks[0].snapshots[0].x.shape[-1]
     radius_fourier_n_freq = 0 if args.disable_radius_fourier else int(args.radius_fourier_n_freq)
     radius_fourier_extra_dim = (2 * radius_fourier_n_freq) if radius_fourier_n_freq > 0 else 0
     x_dim = raw_x_dim + radius_fourier_extra_dim
@@ -1856,7 +2119,7 @@ def main():
     model = StrongANP(
         x_dim=x_dim,
         raw_x_dim=raw_x_dim,
-        y_dim=train_tasks[0].y.shape[-1],
+        y_dim=train_tasks[0].snapshots[0].y.shape[-1],
         d_model=args.d_model,
         d_latent=args.d_latent,
         radial_feature_idx=1,
@@ -1884,6 +2147,8 @@ def main():
         core_radius_weight=args.core_radius_weight,
         core_radius_frac=args.core_radius_frac,
         core_radius_min_bins=args.core_radius_min_bins,
+        num_snapshots=len(args.resolved_snapnums),
+        time_feature_scale=args.time_feature_scale,
     ).to(device)
 
     use_data_parallel = bool(args.enable_data_parallel) and (not ddp_enabled) and (device.type == "cuda") and (torch.cuda.device_count() > 1)
@@ -1915,7 +2180,7 @@ def main():
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=(device.type == "cuda"),
-            collate_fn=anp_collate,
+            collate_fn=collate_fn,
             drop_last=False,
         )
 
@@ -2108,7 +2373,7 @@ def main():
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=(device.type == "cuda"),
-            collate_fn=anp_collate,
+            collate_fn=collate_fn,
             drop_last=False,
         )
 
@@ -2196,6 +2461,9 @@ def main():
             "n_train": len(train_tasks),
             "n_val": len(val_tasks),
             "n_test": len(test_tasks),
+            "n_train_snapshots": int(sum(len(f.snapshots) for f in train_tasks)),
+            "n_val_snapshots": int(sum(len(f.snapshots) for f in val_tasks)),
+            "n_test_snapshots": int(sum(len(f.snapshots) for f in test_tasks)),
             "select_metric": select_metric,
             "best_epoch": best["epoch"],
             "best_score": best["score"],
