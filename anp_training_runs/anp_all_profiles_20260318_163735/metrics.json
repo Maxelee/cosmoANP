@@ -1,0 +1,88 @@
+{
+  "target_name": "all_profiles",
+  "n_tasks_total": 1009,
+  "n_train": 807,
+  "n_val": 100,
+  "n_test": 102,
+  "select_metric": "weighted_orig",
+  "best_epoch": 274,
+  "best_score": 0.4927513974905014,
+  "best_val_loss": 7.19703853726387,
+  "best_val_rmse_norm": 1.7690511775016784,
+  "test": {
+    "rmse_original_units": 0.25834178734643787,
+    "nll_original_units": NaN,
+    "rmse_core_original_units": 0.48538282702165747,
+    "rmse_outer_original_units": 0.1881171525915069,
+    "per_target": {
+      "gas_density": {
+        "rmse_original_units": 0.0,
+        "nll_original_units": NaN,
+        "rmse_core_original_units": 0.0,
+        "rmse_outer_original_units": 0.0
+      },
+      "temperature": {
+        "rmse_original_units": 0.2120889574289322,
+        "nll_original_units": 1.0231355128414208e+16,
+        "rmse_core_original_units": 0.36908549070358276,
+        "rmse_outer_original_units": 0.14889970421791077
+      },
+      "pressure": {
+        "rmse_original_units": 7.486784133018432e-23,
+        "nll_original_units": NaN,
+        "rmse_core_original_units": 1.6317067807387908e-22,
+        "rmse_outer_original_units": 0.0
+      },
+      "metallicity": {
+        "rmse_original_units": 0.17449364066123962,
+        "nll_original_units": 14707929907200.0,
+        "rmse_core_original_units": 0.31523385643959045,
+        "rmse_outer_original_units": 0.11496495455503464
+      }
+    }
+  },
+  "coverage": {
+    "1sigma": 0.6793921972737462,
+    "2sigma": 0.8826038615901942
+  },
+  "fewshot_rmse": {
+    "1": 0.2600895374575082,
+    "2": 0.25939757812743874,
+    "5": 0.2594274843440336,
+    "10": 0.259054021995052
+  },
+  "fewshot_rel_improvement_pct": {
+    "1": 0.0,
+    "2": 0.26604658412393234,
+    "5": 0.2545481528962775,
+    "10": 0.3981380691352675
+  },
+  "mean_prior": {
+    "enabled": true,
+    "hidden_dim": 128,
+    "epochs": 80,
+    "lr": 0.001,
+    "weight_decay": 0.001
+  },
+  "normalization": {
+    "y_mean": [
+      0.0915384590625763,
+      0.042308442294597626,
+      0.10122138261795044,
+      0.023155810311436653
+    ],
+    "y_std": [
+      0.42007768154144287,
+      1.1140117645263672,
+      0.5539118647575378,
+      1.208797574043274
+    ]
+  },
+  "target_names": [
+    "gas_density",
+    "temperature",
+    "pressure",
+    "metallicity"
+  ],
+  "checkpoint": "/mnt/home/mlee1/CAMELS_generate_profiles/anp_training_runs/anp_all_profiles_20260318_163735/best_model.pt"
+}

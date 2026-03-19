@@ -1,0 +1,185 @@
+{
+  "run_dir": "/mnt/home/mlee1/CAMELS_generate_profiles/anp_training_runs/anp_all_profiles_20260317_034453",
+  "device": "cuda",
+  "tests_requested": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "n_passed": 1,
+  "n_total": 5,
+  "results": [
+    {
+      "name": "test_1_loss_curve_sanity",
+      "passed": true,
+      "details": {
+        "has_nan": false,
+        "recon_monotonic_non_decreasing": false,
+        "recon_flatline": false,
+        "kl_positive_after_warmup": true,
+        "rmse_val_train_ratio_max": 1.127923222346039,
+        "rmse_ratio_within_2x": true,
+        "beta_smooth_ramp": true,
+        "plot": "/mnt/home/mlee1/CAMELS_generate_profiles/anp_training_runs/anp_all_profiles_20260317_034453/validation_tests/loss_curves.png"
+      }
+    },
+    {
+      "name": "test_2_overfit_single_task",
+      "passed": false,
+      "details": {
+        "single_run_id": 0,
+        "epochs": 200,
+        "final_rmse_norm": 0.9393800497055054,
+        "best_rmse_norm": 0.9253436326980591,
+        "threshold": 0.05
+      }
+    },
+    {
+      "name": "test_3_fewshot_context_scaling",
+      "passed": false,
+      "details": {
+        "task_run_id": 49,
+        "contexts": [
+          1,
+          2,
+          5,
+          10,
+          16,
+          20,
+          50
+        ],
+        "rmse": {
+          "1": 0.46214988827705383,
+          "2": 0.46069440245628357,
+          "5": 0.4623284637928009,
+          "10": 0.4612113833427429,
+          "20": 0.4621582627296448,
+          "50": 0.46215349435806274,
+          "16": 0.4616420567035675
+        },
+        "strictly_decreasing": false,
+        "plot": "/mnt/home/mlee1/CAMELS_generate_profiles/anp_training_runs/anp_all_profiles_20260317_034453/validation_tests/fewshot_context_scaling.png"
+      }
+    },
+    {
+      "name": "test_4_per_channel_residual_distribution",
+      "passed": false,
+      "details": {
+        "n_tasks_evaluated": 26,
+        "n_ctx": 5,
+        "bias_ok_abs_bias_over_std_lt_0p1": false,
+        "std_ratio_normalized_residual": 3.9482769764804493,
+        "std_ratio_ok_le_3": false,
+        "channels": {
+          "gas_density": {
+            "mean": 8.072333345951269e-28,
+            "std": 1.7791968876977197e-27,
+            "abs_bias_over_std": 8.072333345951269e-16,
+            "std_normalized_residual": 3.411822959462706
+          },
+          "temperature": {
+            "mean": 0.04820870732471379,
+            "std": 1.3599631884076253,
+            "abs_bias_over_std": 0.03544853841313245,
+            "std_normalized_residual": 0.9501621282095567
+          },
+          "pressure": {
+            "mean": 1.0080251410360281e-23,
+            "std": 6.274803369921141e-23,
+            "abs_bias_over_std": 1.0080251410360281e-11,
+            "std_normalized_residual": 3.178295007303567
+          },
+          "metallicity": {
+            "mean": 0.08852700966040933,
+            "std": 0.11950610629562856,
+            "abs_bias_over_std": 0.7407739437298324,
+            "std_normalized_residual": 0.8641295886247712
+          }
+        },
+        "plot": "/mnt/home/mlee1/CAMELS_generate_profiles/anp_training_runs/anp_all_profiles_20260317_034453/validation_tests/per_channel_residual_histograms.png"
+      }
+    },
+    {
+      "name": "test_5_physical_profile_shape",
+      "passed": false,
+      "details": {
+        "pressure_monotonic_decreasing_all_halos": false,
+        "pressure_monotonic_per_halo": [
+          false,
+          false,
+          false
+        ],
+        "temperature_mass_scaling": true,
+        "pressure_mass_scaling": true,
+        "uncertainty_shape_ok": false,
+        "positivity": {
+          "temperature": {
+            "min": 0.02094081975519657,
+            "all_positive": true
+          },
+          "pressure": {
+            "min": 1.1556191033524961e-25,
+            "all_positive": true
+          },
+          "gas_density": {
+            "min": 1.2358307267144015e-29,
+            "all_positive": true
+          },
+          "metallicity": {
+            "min": 4.4024786949157715,
+            "all_positive": true
+          }
+        },
+        "plot": "/mnt/home/mlee1/CAMELS_generate_profiles/anp_training_runs/anp_all_profiles_20260317_034453/validation_tests/profile_shapes.png"
+      }
+    }
+  ],
+  "debug_followup": {
+    "context_sensitivity_probe": {
+      "task_run_id": 49,
+      "mean_abs_mu_delta_norm_nctx1_vs_full": 0.008148509077727795,
+      "target_std_norm": 28.675256729125977,
+      "relative_delta_vs_target_std": 0.0002841651656234766
+    },
+    "latent_stochasticity_probe": {
+      "task_run_id": 49,
+      "mean_prediction_std_across_latent_samples_norm": 0.028279703110456467,
+      "n_draws": 12
+    },
+    "single_task_gradient_probe": {
+      "single_run_id": 0,
+      "rmse_norm_beta0": 79.66222381591797,
+      "rmse_norm_beta1": 79.67366027832031,
+      "recon_beta0": -24900.31640625,
+      "kl_beta1": 0.0038087023422122,
+      "n_params_with_grad": 151,
+      "n_params_nonzero_grad": 151,
+      "nonzero_grad_fraction": 1.0,
+      "median_grad_norm": 1180.0638427734375,
+      "max_grad_norm": 156755.6875
+    },
+    "channel_rmse_concentration_probe": {
+      "n_tasks": 16,
+      "rmse_norm_by_channel": {
+        "gas_density": 66.47744750976562,
+        "temperature": 1.2092150449752808,
+        "pressure": 44.56863021850586,
+        "metallicity": 1.333791732788086
+      },
+      "max_over_min_ratio": 54.97570327627257,
+      "max_channel": "gas_density",
+      "min_channel": "temperature"
+    },
+    "pressure_slope_probe": {
+      "fraction_positive_slopes_per_halo": [
+        0.2564102564102564,
+        0.23076923076923078,
+        0.23076923076923078
+      ],
+      "mean_fraction_positive_slopes": 0.23931623931623933
+    },
+    "report_path": "/mnt/home/mlee1/CAMELS_generate_profiles/anp_training_runs/anp_all_profiles_20260317_034453/validation_tests/validation_debug_followup.json"
+  }
+}
