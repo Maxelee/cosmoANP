@@ -16,14 +16,14 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Normal, kl_divergence
+from torch.distributions import Normal, StudentT, kl_divergence
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 
@@ -176,6 +176,7 @@ class RunTask:
     y: np.ndarray
     n_halo: int
     n_r: int
+    valid_mask: Optional[np.ndarray] = None  # (n_halo, n_r, y_dim) bool
 
 
 @dataclass
@@ -229,24 +230,66 @@ def parse_snapshot_redshifts(mapping_text: str) -> Dict[int, float]:
 
 
 class MeanModel(nn.Module):
-    def __init__(self, y_dim: int, hidden_dim: int = 128):
+    def __init__(self, y_dim: int, hidden_dim: int = 128, use_redshift: bool = False,
+                 theta_dim: int = 0, theta_start_idx: int = 2, n_hidden_layers: int = 2):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, y_dim),
-        )
+        in_dim = 2 + theta_dim + (1 if use_redshift else 0)
+        self.use_redshift = use_redshift
+        self.theta_dim = theta_dim
+        self.theta_start_idx = theta_start_idx
+        layers: List[nn.Module] = []
+        prev = in_dim
+        for _ in range(n_hidden_layers):
+            layers += [nn.Linear(prev, hidden_dim), nn.SiLU()]
+            prev = hidden_dim
+        layers.append(nn.Linear(prev, y_dim))
+        self.net = nn.Sequential(*layers)
 
-    def forward(self, log_m: torch.Tensor, log_r: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.stack([log_m, log_r], dim=-1))
+    def forward(self, log_m: torch.Tensor, log_r: torch.Tensor,
+                theta: Optional[torch.Tensor] = None,
+                redshift: Optional[torch.Tensor] = None) -> torch.Tensor:
+        parts = [log_m.unsqueeze(-1), log_r.unsqueeze(-1)]
+        if self.theta_dim > 0 and theta is not None:
+            if theta.dim() < 2:
+                theta = theta.unsqueeze(-1)
+            parts.append(theta)
+        if self.use_redshift and redshift is not None:
+            parts.append(redshift.unsqueeze(-1))
+        return self.net(torch.cat(parts, dim=-1))
 
 
-def _flatten_mean_training_data(tasks: List[RunTask]) -> Tuple[np.ndarray, np.ndarray]:
-    x_mr = np.concatenate([t.x[:, :, :2].reshape(-1, 2) for t in tasks], axis=0).astype(np.float32)
-    y = np.concatenate([t.y.reshape(-1, t.y.shape[-1]) for t in tasks], axis=0).astype(np.float32)
-    return x_mr, y
+def _flatten_mean_training_data(
+    tasks: List[RunTask],
+    include_redshift: bool = False,
+    theta_dim: int = 0,
+    theta_start_idx: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    parts = []
+    y_parts = []
+    for t in tasks:
+        mr = t.x[:, :, :2].reshape(-1, 2)
+        y_flat = t.y.reshape(-1, t.y.shape[-1])
+        # Exclude rows where any channel is invalid (zero-masked).
+        if t.valid_mask is not None:
+            row_valid = t.valid_mask.reshape(-1, t.valid_mask.shape[-1]).all(axis=1)
+            keep = row_valid
+        else:
+            keep = np.ones(mr.shape[0], dtype=np.bool_)
+        mr = mr[keep]
+        y_flat = y_flat[keep]
+        cols = [mr]
+        if theta_dim > 0:
+            theta_cols = t.x[:, :, theta_start_idx:theta_start_idx + theta_dim].reshape(-1, theta_dim)
+            theta_cols = theta_cols[keep]
+            cols.append(theta_cols)
+        if include_redshift:
+            z_col = np.full((mr.shape[0], 1), t.redshift, dtype=np.float32)
+            cols.append(z_col)
+        parts.append(np.concatenate(cols, axis=1))
+        y_parts.append(y_flat)
+    x_out = np.concatenate(parts, axis=0).astype(np.float32)
+    y = np.concatenate(y_parts, axis=0).astype(np.float32)
+    return x_out, y
 
 
 def train_mean_model(
@@ -257,7 +300,15 @@ def train_mean_model(
     verbose: bool = True,
     num_workers_override: Optional[int] = None,
 ) -> MeanModel:
-    x_np, y_np = _flatten_mean_training_data(tasks)
+    # Detect multi-snapshot: condition mean model on redshift when > 1 unique z.
+    unique_z = set(float(t.redshift) for t in tasks)
+    multi_snap = len(unique_z) > 1
+    mean_theta_dim = int(getattr(args, "mean_theta_dim", 0))
+    theta_start_idx = int(getattr(args, "theta_start_idx", 2))
+    x_np, y_np = _flatten_mean_training_data(
+        tasks, include_redshift=multi_snap,
+        theta_dim=mean_theta_dim, theta_start_idx=theta_start_idx,
+    )
     x = torch.from_numpy(x_np)
     y = torch.from_numpy(y_np)
 
@@ -268,27 +319,72 @@ def train_mean_model(
     y_scale_np = np.where(y_scale_np < 1e-6, 1.0, y_scale_np).astype(np.float32)
     y_scale = torch.from_numpy(y_scale_np).to(device)
 
+    mean_sampler = (
+        DistributedSampler(
+            TensorDataset(x, y),
+            num_replicas=dist_world_size(),
+            rank=dist_rank(),
+            shuffle=True,
+        )
+        if is_dist_ready()
+        else None
+    )
+    if num_workers_override is None:
+        workers = int(args.ddp_num_workers) if is_dist_ready() else int(args.num_workers)
+    else:
+        workers = int(num_workers_override)
+
     loader = DataLoader(
         TensorDataset(x, y),
         batch_size=args.mean_batch_size,
-        shuffle=True,
-        num_workers=args.num_workers if num_workers_override is None else int(num_workers_override),
+        shuffle=(mean_sampler is None),
+        sampler=mean_sampler,
+        num_workers=workers,
         pin_memory=(device.type == "cuda"),
         drop_last=False,
     )
 
-    model = MeanModel(y_dim=y_dim, hidden_dim=args.mean_hidden_dim).to(device)
+    mean_n_hidden = int(getattr(args, "mean_n_hidden", 2))
+    model = MeanModel(
+        y_dim=y_dim, hidden_dim=args.mean_hidden_dim, use_redshift=multi_snap,
+        theta_dim=mean_theta_dim, theta_start_idx=theta_start_idx,
+        n_hidden_layers=mean_n_hidden,
+    ).to(device)
+    if verbose and (multi_snap or mean_theta_dim > 0):
+        extras = []
+        if mean_theta_dim > 0:
+            extras.append(f"theta_dim={mean_theta_dim}")
+        if multi_snap:
+            extras.append(f"z={sorted(unique_z)}")
+        print(f"Mean model conditioned on: {', '.join(extras)}")
+    if is_dist_ready():
+        if device.type == "cuda":
+            model = nn.parallel.DistributedDataParallel(model, device_ids=[device.index], output_device=device.index)
+        else:
+            model = nn.parallel.DistributedDataParallel(model)
     opt = torch.optim.AdamW(list(model.parameters()), lr=args.mean_lr, weight_decay=args.mean_weight_decay)  # type: ignore[arg-type]
-    loss_fn = nn.MSELoss()
+    mean_loss_kind = str(getattr(args, "mean_loss", "mse")).lower()
+    if mean_loss_kind == "huber":
+        loss_fn = nn.HuberLoss(delta=0.5)
+    elif mean_loss_kind == "mae":
+        loss_fn = nn.L1Loss()
+    else:
+        loss_fn = nn.MSELoss()
 
     for epoch in range(args.mean_epochs):
+        if mean_sampler is not None:
+            mean_sampler.set_epoch(epoch)
         model.train()
-        losses = []
+        epoch_loss_sum = 0.0
+        epoch_sample_count = 0
         for xb, yb in loader:
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
 
-            pred = model(xb[:, 0], xb[:, 1])
+            theta_in = xb[:, 2:2 + mean_theta_dim] if mean_theta_dim > 0 else None
+            z_idx = 2 + mean_theta_dim
+            z_in = xb[:, z_idx] if multi_snap else None
+            pred = model(xb[:, 0], xb[:, 1], theta=theta_in, redshift=z_in)
             # Channel-balanced MSE in normalized target space.
             loss = loss_fn((pred - yb) / y_scale.view(1, -1), torch.zeros_like(yb))
 
@@ -297,32 +393,268 @@ def train_mean_model(
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
 
-            losses.append(float(loss.detach().cpu()))
+            bsz = int(xb.shape[0])
+            epoch_loss_sum += float(loss.detach().cpu()) * float(bsz)
+            epoch_sample_count += bsz
+
+        if is_dist_ready():
+            loss_cnt = torch.tensor([epoch_loss_sum, float(epoch_sample_count)], dtype=torch.float64, device=device)
+            dist.all_reduce(loss_cnt, op=dist.ReduceOp.SUM)
+            epoch_loss_sum = float(loss_cnt[0].item())
+            epoch_sample_count = int(loss_cnt[1].item())
 
         if verbose and ((epoch + 1) % max(1, args.mean_log_every) == 0 or epoch == 0 or (epoch + 1) == args.mean_epochs):
-            rmse = math.sqrt(max(0.0, float(np.mean(losses)))) if losses else float("nan")
+            epoch_mse = (epoch_loss_sum / float(max(1, epoch_sample_count))) if epoch_sample_count > 0 else float("nan")
+            rmse = math.sqrt(max(0.0, epoch_mse)) if math.isfinite(epoch_mse) else float("nan")
             print(f"Mean model epoch {epoch+1:03d}/{args.mean_epochs:03d}: RMSE={rmse:.6f}")
 
+    core_model = unwrap_model(model)
+    if not isinstance(core_model, MeanModel):
+        raise TypeError(f"Expected MeanModel, got {type(core_model)}")
+    core_model = cast(MeanModel, core_model)
+    core_model.eval()
+    for p in core_model.parameters():
+        p.requires_grad_(False)
+    return core_model
+
+
+def get_mean_model_config(mean_model: MeanModel) -> Dict[str, Any]:
+    hidden_dim = 0
+    if len(mean_model.net) > 0 and isinstance(mean_model.net[0], nn.Linear):
+        hidden_dim = int(mean_model.net[0].out_features)
+    n_hidden_layers = int(sum(1 for m in mean_model.net if isinstance(m, nn.SiLU)))
+    y_dim = 0
+    if len(mean_model.net) > 0 and isinstance(mean_model.net[-1], nn.Linear):
+        y_dim = int(mean_model.net[-1].out_features)
+    return {
+        "y_dim": y_dim,
+        "hidden_dim": hidden_dim,
+        "use_redshift": bool(mean_model.use_redshift),
+        "theta_dim": int(mean_model.theta_dim),
+        "theta_start_idx": int(mean_model.theta_start_idx),
+        "n_hidden_layers": n_hidden_layers,
+    }
+
+
+def save_mean_checkpoint(
+    checkpoint_path: Path,
+    mean_model: MeanModel,
+    args,
+    target_names: List[str],
+    mean_metrics: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload = {
+        "mean_model_state_dict": mean_model.state_dict(),
+        "mean_model_config": get_mean_model_config(mean_model),
+        "target_name": args.target_name,
+        "target_names": target_names,
+        "args": vars(args),
+        "mean_metrics": mean_metrics,
+    }
+    torch.save(payload, checkpoint_path)
+
+
+def load_mean_checkpoint(checkpoint_path: Path, device: torch.device) -> Tuple[MeanModel, Dict[str, Any]]:
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Mean checkpoint not found: {checkpoint_path}")
+
+    raw = torch.load(checkpoint_path, map_location=device)
+    cfg = raw.get("mean_model_config")
+    state = raw.get("mean_model_state_dict")
+    if cfg is None or state is None:
+        raise ValueError(
+            "Mean checkpoint is missing required keys: 'mean_model_config' and/or 'mean_model_state_dict'"
+        )
+
+    model = MeanModel(
+        y_dim=int(cfg["y_dim"]),
+        hidden_dim=int(cfg["hidden_dim"]),
+        use_redshift=bool(cfg["use_redshift"]),
+        theta_dim=int(cfg["theta_dim"]),
+        theta_start_idx=int(cfg["theta_start_idx"]),
+        n_hidden_layers=int(cfg.get("n_hidden_layers", 2)),
+    ).to(device)
+    model.load_state_dict(state)
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
-    return model
+    return model, raw
+
+
+@torch.no_grad()
+def evaluate_mean_model_metrics(
+    tasks: List[RunTask],
+    mean_model: MeanModel,
+    device: torch.device,
+    batch_size: int,
+    target_names: List[str],
+    core_radius_frac: float = 0.2,
+    core_radius_min_bins: int = 3,
+) -> Dict[str, Any]:
+    if len(tasks) == 0:
+        return {
+            "rmse_original_units": float("nan"),
+            "rmse_core_original_units": float("nan"),
+            "rmse_outer_original_units": float("nan"),
+            "per_target": {},
+            "per_snapshot": {},
+            "n_tasks": 0,
+        }
+
+    y_dim = int(tasks[0].y.shape[-1])
+    sum_sq = torch.zeros((y_dim,), dtype=torch.float64, device=device)
+    sum_w = torch.zeros((y_dim,), dtype=torch.float64, device=device)
+    sum_sq_core = torch.zeros((y_dim,), dtype=torch.float64, device=device)
+    sum_w_core = torch.zeros((y_dim,), dtype=torch.float64, device=device)
+    sum_sq_outer = torch.zeros((y_dim,), dtype=torch.float64, device=device)
+    sum_w_outer = torch.zeros((y_dim,), dtype=torch.float64, device=device)
+
+    per_snap_sq: Dict[int, float] = {}
+    per_snap_w: Dict[int, float] = {}
+
+    ts = int(mean_model.theta_start_idx)
+    td = int(mean_model.theta_dim)
+
+    for t in tasks:
+        flat_x = torch.from_numpy(t.x[:, :, :2].reshape(-1, 2)).to(device)
+        theta_flat = None
+        if td > 0:
+            theta_flat = torch.from_numpy(t.x[:, :, ts : ts + td].reshape(-1, td)).to(device)
+        z_col = (
+            torch.full((flat_x.shape[0],), t.redshift, dtype=torch.float32, device=device)
+            if mean_model.use_redshift
+            else None
+        )
+
+        preds = []
+        for i in range(0, flat_x.shape[0], max(1, int(batch_size))):
+            xb = flat_x[i : i + batch_size]
+            tb = theta_flat[i : i + batch_size] if theta_flat is not None else None
+            zb = z_col[i : i + batch_size] if z_col is not None else None
+            preds.append(mean_model(xb[:, 0], xb[:, 1], theta=tb, redshift=zb))
+
+        mu = torch.cat(preds, dim=0).reshape(t.y.shape)
+        y = torch.from_numpy(t.y).to(device)
+
+        if len(target_names) > 1:
+            y, mu, _ = restore_all_profiles_physical_units(y, mu, None, target_names)
+
+        resid_sq = (mu - y).pow(2).to(torch.float64)
+        valid_mask_f = None
+        if t.valid_mask is not None:
+            valid_mask_f = torch.from_numpy(t.valid_mask).to(device=device, dtype=torch.float64)
+            resid_sq = resid_sq * valid_mask_f
+        n_halo = int(t.n_halo)
+        n_r = int(t.n_r)
+
+        sum_sq += resid_sq.sum(dim=(0, 1))
+        if valid_mask_f is not None:
+            sum_w += valid_mask_f.sum(dim=(0, 1))
+        else:
+            w_total = float(max(1, n_halo * n_r))
+            sum_w += torch.full((y_dim,), w_total, dtype=torch.float64, device=device)
+
+        n_core = max(int(core_radius_min_bins), int(math.ceil(float(core_radius_frac) * n_r)))
+        n_core = min(max(0, n_core), n_r)
+        if n_core > 0 and n_halo > 0 and n_r > 0:
+            core_mask = (torch.arange(n_r, device=device) < n_core).view(1, n_r, 1).expand(n_halo, n_r, 1)
+            outer_mask = ~core_mask
+
+            core_mask_f = core_mask.to(resid_sq.dtype)
+            outer_mask_f = outer_mask.to(resid_sq.dtype)
+            if valid_mask_f is not None:
+                core_mask_f = core_mask_f * valid_mask_f
+                outer_mask_f = outer_mask_f * valid_mask_f
+
+            sum_sq_core += (resid_sq * core_mask_f).sum(dim=(0, 1))
+            sum_sq_outer += (resid_sq * outer_mask_f).sum(dim=(0, 1))
+
+            if valid_mask_f is not None:
+                sum_w_core += core_mask_f.sum(dim=(0, 1))
+                sum_w_outer += outer_mask_f.sum(dim=(0, 1))
+            else:
+                w_core = float(core_mask.sum().item())
+                w_outer = float(outer_mask.sum().item())
+                sum_w_core += torch.full((y_dim,), w_core, dtype=torch.float64, device=device)
+                sum_w_outer += torch.full((y_dim,), w_outer, dtype=torch.float64, device=device)
+
+        snap_sq = float(resid_sq.sum().detach().cpu().item())
+        if valid_mask_f is not None:
+            snap_w = float(max(1.0, valid_mask_f.sum().detach().cpu().item()))
+        else:
+            snap_w = float(max(1, n_halo * n_r))
+        per_snap_sq[t.snapnum] = per_snap_sq.get(t.snapnum, 0.0) + snap_sq
+        per_snap_w[t.snapnum] = per_snap_w.get(t.snapnum, 0.0) + snap_w
+
+    rmse_by_target = torch.sqrt(sum_sq / sum_w.clamp_min(1.0)).detach().cpu().numpy().tolist()
+    rmse_core_by_target = torch.sqrt(sum_sq_core / sum_w_core.clamp_min(1.0)).detach().cpu().numpy().tolist()
+    rmse_outer_by_target = torch.sqrt(sum_sq_outer / sum_w_outer.clamp_min(1.0)).detach().cpu().numpy().tolist()
+
+    total_sq = float(sum_sq.sum().detach().cpu().item())
+    total_w = float(sum_w.sum().detach().cpu().item())
+    total_sq_core = float(sum_sq_core.sum().detach().cpu().item())
+    total_w_core = float(sum_w_core.sum().detach().cpu().item())
+    total_sq_outer = float(sum_sq_outer.sum().detach().cpu().item())
+    total_w_outer = float(sum_w_outer.sum().detach().cpu().item())
+
+    per_target = {
+        name: {
+            "rmse_original_units": float(rmse_by_target[i]),
+            "rmse_core_original_units": float(rmse_core_by_target[i]),
+            "rmse_outer_original_units": float(rmse_outer_by_target[i]),
+        }
+        for i, name in enumerate(target_names)
+    }
+
+    per_snapshot = {
+        int(snap): {
+            "rmse_original_units": float(math.sqrt(sq / max(1.0, per_snap_w[snap]))),
+            "n_points": int(per_snap_w[snap]),
+        }
+        for snap, sq in sorted(per_snap_sq.items())
+    }
+
+    return {
+        "rmse_original_units": float(math.sqrt(total_sq / max(1.0, total_w))),
+        "rmse_core_original_units": float(math.sqrt(total_sq_core / max(1.0, total_w_core))),
+        "rmse_outer_original_units": float(math.sqrt(total_sq_outer / max(1.0, total_w_outer))),
+        "per_target": per_target,
+        "per_snapshot": per_snapshot,
+        "n_tasks": int(len(tasks)),
+    }
 
 
 @torch.no_grad()
 def predict_mean_from_raw_x(raw_x: torch.Tensor, mean_model: MeanModel) -> torch.Tensor:
-    return mean_model(raw_x[..., 0], raw_x[..., 1])
+    theta_in = None
+    if mean_model.theta_dim > 0:
+        ts = mean_model.theta_start_idx
+        theta_in = raw_x[..., ts:ts + mean_model.theta_dim]
+    z_in = None
+    if mean_model.use_redshift:
+        z_in = raw_x[..., -1]
+    return mean_model(raw_x[..., 0], raw_x[..., 1], theta=theta_in, redshift=z_in)
 
 
 @torch.no_grad()
 def apply_residual_prior(tasks: List[RunTask], mean_model: MeanModel, device: torch.device, batch_size: int) -> List[RunTask]:
     out: List[RunTask] = []
+    ts = mean_model.theta_start_idx
+    td = mean_model.theta_dim
     for t in tasks:
         flat_x = torch.from_numpy(t.x[:, :, :2].reshape(-1, 2)).to(device)
+        theta_flat = None
+        if td > 0:
+            theta_flat = torch.from_numpy(
+                t.x[:, :, ts:ts + td].reshape(-1, td)
+            ).to(device)
+        z_col = torch.full((flat_x.shape[0],), t.redshift, dtype=torch.float32, device=device) if mean_model.use_redshift else None
         preds = []
         for i in range(0, flat_x.shape[0], batch_size):
             xb = flat_x[i : i + batch_size]
-            preds.append(mean_model(xb[:, 0], xb[:, 1]).detach().cpu())
+            tb = theta_flat[i : i + batch_size] if theta_flat is not None else None
+            zb = z_col[i : i + batch_size] if z_col is not None else None
+            preds.append(mean_model(xb[:, 0], xb[:, 1], theta=tb, redshift=zb).detach().cpu())
         mean_y = torch.cat(preds, dim=0).numpy().reshape(t.y.shape).astype(np.float32)
         y_resid = (t.y - mean_y).astype(np.float32)
         out.append(
@@ -335,6 +667,7 @@ def apply_residual_prior(tasks: List[RunTask], mean_model: MeanModel, device: to
                 y=y_resid,
                 n_halo=t.n_halo,
                 n_r=t.n_r,
+                valid_mask=t.valid_mask,
             )
         )
     return out
@@ -385,6 +718,220 @@ def discover_runs(base_path: Path, suite: str, sim_set: str, snapnum: int) -> Li
     return sorted(out)
 
 
+# ── Cool-core indicator ──────────────────────────────────────────────
+# Physical constants for analytical T500 (CGS).
+_CC_G = 6.674e-8        # cm^3 g^-1 s^-2
+_CC_KB = 1.381e-16       # erg K^-1
+_CC_MP = 1.673e-24       # g
+_CC_MU = 0.59            # mean molecular weight (ionised primordial gas)
+_CC_MSUN = 1.989e33      # g
+_CC_KPC = 3.086e21       # cm
+_CC_KEV_TO_K = 1.16e7    # K per keV
+
+
+def compute_cc_indicator(
+    m500c: np.ndarray,
+    r500c: np.ndarray,
+    temperature_array: np.ndarray,
+    core_bins: int = 6,
+    eps: float = 1e-30,
+) -> np.ndarray:
+    """Compute log10(T_core / T500_analytic) per halo.
+
+    Parameters
+    ----------
+    m500c : (n_halo,) M500c in solar masses.
+    r500c : (n_halo,) R500c in physical kpc.
+    temperature_array : (n_halo, n_r) temperature profile in keV.
+    core_bins : number of innermost radial bins to average for T_core.
+
+    Returns
+    -------
+    cc : (n_halo,) log10(T_core / T500) — negative ≈ cool-core, positive ≈ NCC.
+    """
+    m = np.asarray(m500c, dtype=np.float64)
+    R = np.asarray(r500c, dtype=np.float64)
+    T = np.asarray(temperature_array, dtype=np.float64)
+
+    T500_K = _CC_MU * _CC_MP * _CC_G * (m * _CC_MSUN) / (2.0 * _CC_KB * (R * _CC_KPC))
+    T500_keV = T500_K / _CC_KEV_TO_K
+
+    T_core = T[:, :core_bins].mean(axis=1)
+    ratio = np.clip(T_core, eps, None) / np.clip(T500_keV, eps, None)
+    return np.log10(ratio).astype(np.float32)
+
+
+def fit_cc_prior(
+    families: List["RunFamilyTask"],
+    cc_feature_idx: int,
+    n_mass_bins: int = 10,
+) -> Dict[str, Any]:
+    """Fit an empirical CC-indicator prior p(cc | log_M) from training data.
+
+    Returns a dict suitable for storing in a checkpoint and sampling at inference.
+    The prior is a per-mass-bin Gaussian: for each bin we store (mean_cc, std_cc).
+    """
+    all_logM = []
+    all_cc = []
+    for fam in families:
+        for task in fam.snapshots:
+            # x shape: (n_halo, n_r, x_dim) — CC is constant across r,
+            # so take first radial bin.
+            logM = task.x[:, 0, 0].astype(np.float64)  # un-normalized at this point
+            cc = task.x[:, 0, cc_feature_idx].astype(np.float64)
+            all_logM.append(logM)
+            all_cc.append(cc)
+
+    all_logM = np.concatenate(all_logM)
+    all_cc = np.concatenate(all_cc)
+
+    # Global fallback.
+    global_mean = float(np.mean(all_cc))
+    global_std = float(np.std(all_cc))
+
+    # Bin edges by percentile to get roughly equal counts.
+    bin_edges = np.percentile(all_logM, np.linspace(0, 100, n_mass_bins + 1))
+    bin_edges[0] -= 1e-3
+    bin_edges[-1] += 1e-3
+
+    bin_mean = np.full(n_mass_bins, global_mean)
+    bin_std = np.full(n_mass_bins, global_std)
+    for i in range(n_mass_bins):
+        mask = (all_logM >= bin_edges[i]) & (all_logM < bin_edges[i + 1])
+        if mask.sum() > 2:
+            bin_mean[i] = float(np.mean(all_cc[mask]))
+            bin_std[i] = float(max(np.std(all_cc[mask]), 0.01))
+
+    return {
+        "bin_edges": bin_edges.tolist(),
+        "bin_mean": bin_mean.tolist(),
+        "bin_std": bin_std.tolist(),
+        "global_mean": global_mean,
+        "global_std": max(global_std, 0.01),
+        "n_halos": int(len(all_cc)),
+    }
+
+
+class CCPredictor(nn.Module):
+    """Small MLP that predicts CC indicator distribution from (logM, theta).
+
+    Outputs (mu_cc, log_sigma_cc) — a Gaussian p(cc | logM, theta).
+    Trained on training-set halos before ANP training begins, analogous
+    to the mean model.
+    """
+
+    def __init__(self, theta_dim: int = 35, hidden_dim: int = 128, n_layers: int = 3):
+        super().__init__()
+        in_dim = 1 + theta_dim  # logM + theta
+        layers: list[nn.Module] = []
+        prev = in_dim
+        for _ in range(n_layers):
+            layers += [nn.Linear(prev, hidden_dim), nn.GELU()]
+            prev = hidden_dim
+        layers.append(nn.Linear(prev, 2))  # (mu_cc, log_sigma_cc)
+        self.net = nn.Sequential(*layers)
+        self.theta_dim = theta_dim
+
+    def forward(self, log_mass: torch.Tensor, theta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (mu_cc, sigma_cc) per halo.
+
+        Parameters
+        ----------
+        log_mass : (N,) log10(M500c)
+        theta : (N, theta_dim) feedback / cosmological parameters
+        """
+        x = torch.cat([log_mass.unsqueeze(-1), theta], dim=-1)
+        out = self.net(x)
+        mu = out[:, 0]
+        sigma = out[:, 1].exp().clamp(min=0.01, max=2.0)
+        return mu, sigma
+
+
+def train_cc_predictor(
+    families: List["RunFamilyTask"],
+    cc_feature_idx: int,
+    theta_start_idx: int = 2,
+    theta_dim: int = 35,
+    hidden_dim: int = 128,
+    n_layers: int = 3,
+    lr: float = 1e-3,
+    epochs: int = 200,
+    batch_size: int = 4096,
+    device: torch.device = torch.device("cpu"),
+    verbose: bool = True,
+) -> CCPredictor:
+    """Pre-train a CCPredictor on training data CC indicators.
+
+    Collects (logM, theta, cc) from all training halos and fits
+    p(cc | logM, theta) as a heteroscedastic Gaussian.
+    """
+    all_logM = []
+    all_theta = []
+    all_cc = []
+    for fam in families:
+        for task in fam.snapshots:
+            n_h = task.x.shape[0]
+            logM = task.x[:, 0, 0].astype(np.float32)           # (n_halo,)
+            theta = task.x[:, 0, theta_start_idx:theta_start_idx + theta_dim].astype(np.float32)  # (n_halo, theta_dim)
+            cc = task.x[:, 0, cc_feature_idx].astype(np.float32)  # (n_halo,)
+            all_logM.append(logM)
+            all_theta.append(theta)
+            all_cc.append(cc)
+
+    logM_t = torch.from_numpy(np.concatenate(all_logM))
+    theta_t = torch.from_numpy(np.concatenate(all_theta))
+    cc_t = torch.from_numpy(np.concatenate(all_cc))
+
+    n_total = logM_t.shape[0]
+    if verbose:
+        print(f"Training CCPredictor on {n_total} halos, theta_dim={theta_dim}, "
+              f"hidden={hidden_dim}, layers={n_layers}")
+
+    model = CCPredictor(theta_dim=theta_dim, hidden_dim=hidden_dim, n_layers=n_layers).to(device)
+    params = cast(List[torch.Tensor], list(model.parameters()))
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
+
+    dataset = torch.utils.data.TensorDataset(logM_t, theta_t, cc_t)
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, drop_last=False,
+    )
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_nll = 0.0
+        n_samples = 0
+        for logM_b, theta_b, cc_b in loader:
+            logM_b = logM_b.to(device)
+            theta_b = theta_b.to(device)
+            cc_b = cc_b.to(device)
+
+            mu, sigma = model(logM_b, theta_b)
+            # Negative log-likelihood of Gaussian.
+            nll = 0.5 * (((cc_b - mu) / sigma) ** 2 + 2.0 * sigma.log() + math.log(2.0 * math.pi))
+            loss = nll.mean()
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()
+
+            epoch_nll += float(loss.detach()) * logM_b.shape[0]
+            n_samples += logM_b.shape[0]
+
+        scheduler.step()
+
+        if verbose and ((epoch + 1) % 50 == 0 or epoch == 0 or (epoch + 1) == epochs):
+            avg_nll = epoch_nll / max(1, n_samples)
+            print(f"  CCPredictor epoch {epoch+1:03d}/{epochs:03d}: NLL={avg_nll:.4f}")
+
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+# ─────────────────────────────────────────────────────────────────────
+
+
 def load_theta_table(param_csv: Path, target_theta_dim: int = 35) -> Dict[int, np.ndarray]:
     if not param_csv.exists():
         raise FileNotFoundError(f"Parameter CSV not found: {param_csv}")
@@ -407,7 +954,11 @@ def select_target(
     mp: float,
     eps: float,
     all_profile_targets: Optional[List[str]] = None,
-) -> np.ndarray:
+    log_channel_floor: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (y, valid_mask).  valid_mask is True where the raw value > 0
+    for positive-definite (log-transformed) channels, True everywhere else.
+    If log_channel_floor > 0, values below it are additionally marked invalid."""
     rho = npz_data["gas_density_array"].astype(np.float32)
     temp = npz_data["temperature_array"].astype(np.float32)
 
@@ -440,23 +991,32 @@ def select_target(
     if target_name == "xsb_proxy":
         n_e = rho / (mu_e * mp)
         sx_proxy = np.clip(n_e**2 * np.sqrt(np.clip(temp, 1e-6, None)), eps, None)
-        return np.log10(sx_proxy).astype(np.float32)
+        y = np.log10(sx_proxy).astype(np.float32)
+        return y, np.ones_like(y, dtype=np.bool_)
 
     if target_name == "all_profiles":
         selected_targets = all_profile_targets if all_profile_targets else ALL_PROFILE_TARGETS
         channels = []
+        valid_channels = []
+        log_floor = float(log_channel_floor) if log_channel_floor > 0 else 0.0
         for name in selected_targets:
             arr = target_map[name]
             if name in ALL_PROFILE_LOG_TARGETS:
+                threshold = log_floor if log_floor > 0 else 0.0
+                valid_channels.append((arr > threshold))
                 arr = np.log10(np.clip(arr, eps, None))
+            else:
+                valid_channels.append(np.ones(arr.shape, dtype=np.bool_))
             channels.append(arr)
         stacked = np.stack(channels, axis=-1)
-        return stacked.astype(np.float32)
+        valid_stacked = np.stack(valid_channels, axis=-1)
+        return stacked.astype(np.float32), valid_stacked
 
     if target_name not in target_map:
         raise ValueError(f"Unsupported target {target_name}; choose from {TARGET_CHOICES}")
 
-    return target_map[target_name]
+    y = target_map[target_name]
+    return y, np.ones_like(y, dtype=np.bool_)
 
 
 def build_tasks(args) -> List[RunFamilyTask]:
@@ -468,6 +1028,7 @@ def build_tasks(args) -> List[RunFamilyTask]:
     snapnums = list(args.resolved_snapnums)
     snapnum_to_idx = {int(s): i for i, s in enumerate(snapnums)}
     redshift_by_snap = dict(args.redshift_by_snap)
+    use_cc_indicator = bool(getattr(args, "cc_indicator", False))
 
     discovered_by_snap = {
         int(s): discover_runs(base_path, suite=args.suite, sim_set=args.sim_set, snapnum=int(s))
@@ -504,23 +1065,60 @@ def build_tasks(args) -> List[RunFamilyTask]:
                     m500c = data["M500c"].astype(np.float32)
                     r500c = data["R500c"].astype(np.float32)
                     r = data["radial_bins"].astype(np.float32)
-                    y = select_target(
+                    y, valid_mask = select_target(
                         data,
                         target_name=args.target_name,
                         mu_e=mu_e,
                         mp=mp,
                         eps=args.eps,
                         all_profile_targets=getattr(args, "resolved_all_profile_targets", None),
+                        log_channel_floor=float(getattr(args, "log_channel_floor", 0.0)),
                     )
+                    # Load temperature for CC indicator before NPZ context closes.
+                    if use_cc_indicator:
+                        temperature_for_cc = data["temperature_array"].astype(np.float32)
 
                 if y.ndim == 2:
                     y = y[..., None]
+                    valid_mask = valid_mask[..., None]
                 if y.ndim != 3:
                     raise ValueError(f"Expected target with ndim 2 or 3; got shape {y.shape}")
 
                 if args.radial_stride > 1:
                     r = r[:: args.radial_stride]
                     y = y[:, :: args.radial_stride, :]
+                    valid_mask = valid_mask[:, :: args.radial_stride, :]
+
+                # ---- Mass floor: drop halos below threshold ----
+                mass_floor = float(getattr(args, "mass_floor", 0.0))
+                if mass_floor > 0.0:
+                    log_m_raw = np.log10(np.clip(m500c, 1e10, None))
+                    mass_keep = log_m_raw >= mass_floor
+                    if mass_keep.sum() == 0:
+                        continue
+                    if mass_keep.sum() < m500c.shape[0]:
+                        m500c = m500c[mass_keep]
+                        r500c = r500c[mass_keep]
+                        y = y[mass_keep]
+                        valid_mask = valid_mask[mass_keep]
+                        if use_cc_indicator:
+                            temperature_for_cc = temperature_for_cc[mass_keep]
+
+                # ---- Drop halos with too many invalid (zero) points ----
+                min_valid_frac = float(getattr(args, "min_valid_frac", 0.5))
+                if min_valid_frac > 0.0 and valid_mask is not None:
+                    # Fraction of valid points per halo across all channels and radii.
+                    per_halo_valid_frac = valid_mask.reshape(valid_mask.shape[0], -1).mean(axis=1)
+                    valid_keep = per_halo_valid_frac >= min_valid_frac
+                    if valid_keep.sum() == 0:
+                        continue
+                    if valid_keep.sum() < m500c.shape[0]:
+                        m500c = m500c[valid_keep]
+                        r500c = r500c[valid_keep]
+                        y = y[valid_keep]
+                        valid_mask = valid_mask[valid_keep]
+                        if use_cc_indicator:
+                            temperature_for_cc = temperature_for_cc[valid_keep]
 
                 if args.max_halos_per_run > 0 and m500c.shape[0] > args.max_halos_per_run:
                     rng = np.random.default_rng(args.seed + run + int(snap))
@@ -528,6 +1126,9 @@ def build_tasks(args) -> List[RunFamilyTask]:
                     m500c = m500c[pick]
                     r500c = r500c[pick]
                     y = y[pick]
+                    valid_mask = valid_mask[pick]
+                    if use_cc_indicator:
+                        temperature_for_cc = temperature_for_cc[pick]
 
                 n_halo, n_r, _ = y.shape
                 if n_halo < args.min_halos:
@@ -537,10 +1138,32 @@ def build_tasks(args) -> List[RunFamilyTask]:
                 r500_for_ratio = r500c * float(args.r500_physical_factor)
                 log_r_scaled = np.log10(np.clip(r[None, :] / r500_for_ratio[:, None], 1e-4, None))
 
-                x = np.zeros((n_halo, n_r, args.theta_start_idx + args.theta_dim), dtype=np.float32)
+                x_dim = int(args.theta_start_idx + args.theta_dim)
+                use_continuous_redshift = bool(getattr(args, "use_continuous_redshift_feature", False))
+                if use_continuous_redshift:
+                    x_dim += 1
+                if use_cc_indicator:
+                    x_dim += 1
+                x = np.zeros((n_halo, n_r, x_dim), dtype=np.float32)
                 x[..., 0] = log_m
                 x[..., 1] = log_r_scaled
                 x[..., args.theta_start_idx : args.theta_start_idx + args.theta_dim] = theta_by_run[run][None, None, :]
+                if use_continuous_redshift:
+                    z_idx = int(getattr(args, "redshift_feature_idx", args.theta_start_idx + args.theta_dim))
+                    if z_idx != (args.theta_start_idx + args.theta_dim):
+                        raise ValueError(
+                            "redshift_feature_idx must equal theta_start_idx + theta_dim "
+                            "for the current appended-redshift layout"
+                        )
+                    x[..., z_idx] = float(redshift_by_snap[int(snap)])
+                if use_cc_indicator:
+                    cc_idx = int(args.cc_indicator_feature_idx)
+                    cc_vals = compute_cc_indicator(
+                        m500c, r500c, temperature_for_cc,
+                        core_bins=int(args.cc_indicator_core_bins),
+                        eps=args.eps,
+                    )
+                    x[..., cc_idx] = cc_vals[:, None]  # broadcast to all r
 
                 snapshots.append(
                     RunTask(
@@ -552,6 +1175,7 @@ def build_tasks(args) -> List[RunFamilyTask]:
                         y=y.astype(np.float32),
                         n_halo=n_halo,
                         n_r=n_r,
+                        valid_mask=valid_mask,
                     )
                 )
 
@@ -612,34 +1236,206 @@ def count_snapshot_presence(families: List[RunFamilyTask], snapnum: int) -> int:
     return int(sum(1 for fam in families for s in fam.snapshots if int(s.snapnum) == int(snapnum)))
 
 
-def compute_norm_stats(train_tasks: List[RunFamilyTask], eps: float = 1e-6):
+def compute_norm_stats(
+    train_tasks: List[RunFamilyTask],
+    eps: float = 1e-6,
+    robust: bool = False,
+    mass_redshift_aware: bool = False,
+    mass_bin_edges: Optional[np.ndarray] = None,
+):
+    """Compute normalization statistics from training data.
+
+    When *robust* is True, use median / MAD (scaled to equivalent std)
+    instead of mean / std for the y-channels.  This is more resistant to
+    heavy-tailed outliers from extreme-mass or poorly-resolved halos.
+
+    When *mass_redshift_aware* is True, additionally compute per-bin
+    y-statistics keyed by (mass_bin, redshift).  At normalization time
+    each halo is normalized with the stats from its own bin, producing
+    a tighter, more homogeneous distribution for the network.
+    """
     flat = flatten_family_tasks(train_tasks)
     x_stack = np.concatenate([t.x.reshape(-1, t.x.shape[-1]) for t in flat], axis=0)
     y_stack = np.concatenate([t.y.reshape(-1, t.y.shape[-1]) for t in flat], axis=0)
+
+    # Build per-channel validity mask to exclude zero-valued points.
+    has_valid = any(t.valid_mask is not None for t in flat)
+    if has_valid:
+        vm_stack = np.concatenate(
+            [
+                (t.valid_mask if t.valid_mask is not None
+                 else np.ones_like(t.y, dtype=np.bool_)).reshape(-1, t.y.shape[-1])
+                for t in flat
+            ],
+            axis=0,
+        )
+    else:
+        vm_stack = np.ones_like(y_stack, dtype=np.bool_)
 
     x_mean = x_stack.mean(axis=0).astype(np.float32)
     x_std = x_stack.std(axis=0).astype(np.float32)
     x_std = np.where(x_std < eps, 1.0, x_std).astype(np.float32)
 
-    y_mean = y_stack.mean(axis=0).astype(np.float32)
-    y_std = y_stack.std(axis=0).astype(np.float32)
-    y_std = np.where(y_std < eps, 1.0, y_std).astype(np.float32)
+    y_dim = y_stack.shape[1]
+    y_mean = np.zeros(y_dim, dtype=np.float32)
+    y_std = np.ones(y_dim, dtype=np.float32)
+    n_masked_total = 0
+    for ch in range(y_dim):
+        valid_vals = y_stack[:, ch][vm_stack[:, ch]]
+        n_masked_total += int((~vm_stack[:, ch]).sum())
+        if len(valid_vals) > 0:
+            if robust:
+                med = float(np.median(valid_vals))
+                mad = float(np.median(np.abs(valid_vals - med)))
+                y_mean[ch] = np.float32(med)
+                y_std[ch] = np.float32(max(mad * 1.4826, eps))  # MAD → std scale
+            else:
+                y_mean[ch] = valid_vals.mean().astype(np.float32)
+                y_std[ch] = valid_vals.std().astype(np.float32)
+                if y_std[ch] < eps:
+                    y_std[ch] = 1.0
+    if n_masked_total > 0:
+        print(f"[compute_norm_stats] Excluded {n_masked_total} zero-valued "
+              f"point-channels from y normalization stats.")
+    if robust:
+        print("[compute_norm_stats] Used robust (median/MAD) normalization for y-channels.")
 
-    return {
+    result: Dict[str, Any] = {
         "x_mean": x_mean,
         "x_std": x_std,
         "y_mean": y_mean,
         "y_std": y_std,
     }
 
+    # ---- Mass / redshift conditioned stats ----
+    if mass_redshift_aware:
+        if mass_bin_edges is None:
+            mass_bin_edges = np.array([11.0, 12.0, 12.5, 13.0, 13.5, 14.0, 16.0], dtype=np.float32)
+        mass_bin_edges = np.asarray(mass_bin_edges, dtype=np.float32)
+        # Collect per-halo mass and redshift alongside the y-values.
+        logm_list, z_list, y_halo_list, vm_halo_list = [], [], [], []
+        for t in flat:
+            # x[..., 0] is log_m (broadcast across radii); take first radial bin.
+            logm_per_halo = t.x[:, 0, 0]  # (n_halo,)
+            z_per_halo = np.full(t.n_halo, t.redshift, dtype=np.float32)
+            logm_list.append(logm_per_halo)
+            z_list.append(z_per_halo)
+            y_halo_list.append(t.y)  # (n_halo, n_r, y_dim)
+            if t.valid_mask is not None:
+                vm_halo_list.append(t.valid_mask)
+            else:
+                vm_halo_list.append(np.ones_like(t.y, dtype=np.bool_))
+
+        logm_all = np.concatenate(logm_list, axis=0)     # (N,)
+        z_all = np.concatenate(z_list, axis=0)            # (N,)
+        y_all = np.concatenate(y_halo_list, axis=0)       # (N, n_r, y_dim)
+        vm_all = np.concatenate(vm_halo_list, axis=0)     # (N, n_r, y_dim)
+
+        unique_z = np.sort(np.unique(np.round(z_all, decimals=4)))
+        mass_bin_idx = np.digitize(logm_all, mass_bin_edges) - 1
+        mass_bin_idx = np.clip(mass_bin_idx, 0, len(mass_bin_edges) - 2)
+        n_mass_bins = len(mass_bin_edges) - 1
+
+        # Per-bin stats: dict keyed by (mass_bin_idx, z_rounded) -> {y_mean, y_std}
+        bin_stats: Dict[str, Dict[str, np.ndarray]] = {}
+        for mi in range(n_mass_bins):
+            for z_val in unique_z:
+                sel = (mass_bin_idx == mi) & (np.abs(z_all - z_val) < 0.01)
+                key = f"{mi}_{z_val:.4f}"
+                if sel.sum() < 20:
+                    # Fall back to global stats when too few halos in this bin.
+                    bin_stats[key] = {"y_mean": y_mean.copy(), "y_std": y_std.copy()}
+                    continue
+                y_sel = y_all[sel].reshape(-1, y_dim)     # (n_sel * n_r, y_dim)
+                vm_sel = vm_all[sel].reshape(-1, y_dim)
+                bm = np.zeros(y_dim, dtype=np.float32)
+                bs = np.ones(y_dim, dtype=np.float32)
+                for ch in range(y_dim):
+                    vals = y_sel[:, ch][vm_sel[:, ch]]
+                    if len(vals) < 10:
+                        bm[ch] = y_mean[ch]
+                        bs[ch] = y_std[ch]
+                    elif robust:
+                        med = float(np.median(vals))
+                        mad = float(np.median(np.abs(vals - med)))
+                        bm[ch] = np.float32(med)
+                        bs[ch] = np.float32(max(mad * 1.4826, eps))
+                    else:
+                        bm[ch] = vals.mean().astype(np.float32)
+                        s = vals.std().astype(np.float32)
+                        bs[ch] = s if s >= eps else 1.0
+                bin_stats[key] = {"y_mean": bm, "y_std": bs}
+
+        result["mass_redshift_aware"] = True
+        result["mass_bin_edges"] = mass_bin_edges
+        result["unique_z"] = unique_z
+        result["bin_stats"] = bin_stats
+        n_bins_filled = sum(1 for v in bin_stats.values()
+                           if not np.array_equal(v["y_mean"], y_mean))
+        print(f"[compute_norm_stats] Mass-redshift aware: {n_mass_bins} mass bins × "
+              f"{len(unique_z)} redshifts = {len(bin_stats)} bins "
+              f"({n_bins_filled} with enough data).")
+
+    return result
+
+
+def _lookup_bin_stats(
+    stats: Dict[str, Any],
+    log_m_per_halo: np.ndarray,
+    redshift: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Look up per-halo y_mean, y_std from mass-redshift bins.
+
+    Returns arrays of shape (n_halo, 1, y_dim) for broadcasting with
+    y of shape (n_halo, n_r, y_dim).
+    """
+    mass_bin_edges = stats["mass_bin_edges"]
+    bin_stats = stats["bin_stats"]
+    unique_z = stats["unique_z"]
+
+    # Snap redshift to nearest available z value.
+    z_idx = int(np.argmin(np.abs(unique_z - redshift)))
+    z_val = unique_z[z_idx]
+
+    mass_bin_idx = np.digitize(log_m_per_halo, mass_bin_edges) - 1
+    mass_bin_idx = np.clip(mass_bin_idx, 0, len(mass_bin_edges) - 2)
+
+    n_halo = len(log_m_per_halo)
+    y_dim = stats["y_mean"].shape[0]
+    y_mean_out = np.zeros((n_halo, 1, y_dim), dtype=np.float32)
+    y_std_out = np.ones((n_halo, 1, y_dim), dtype=np.float32)
+
+    for mi in np.unique(mass_bin_idx):
+        key = f"{mi}_{z_val:.4f}"
+        bs = bin_stats.get(key, {"y_mean": stats["y_mean"], "y_std": stats["y_std"]})
+        mask = mass_bin_idx == mi
+        y_mean_out[mask, 0, :] = bs["y_mean"]
+        y_std_out[mask, 0, :] = bs["y_std"]
+
+    return y_mean_out, y_std_out
+
 
 def normalize_tasks(tasks: List[RunFamilyTask], stats) -> List[RunFamilyTask]:
+    mass_redshift_aware = bool(stats.get("mass_redshift_aware", False))
+
     out: List[RunFamilyTask] = []
     for fam in tasks:
         snaps: List[RunTask] = []
         for t in fam.snapshots:
             x = ((t.x - stats["x_mean"][None, None, :]) / stats["x_std"][None, None, :]).astype(np.float32)
-            y = ((t.y - stats["y_mean"][None, None, :]) / stats["y_std"][None, None, :]).astype(np.float32)
+
+            if mass_redshift_aware:
+                # Per-halo normalization based on mass and redshift bin.
+                log_m_per_halo = t.x[:, 0, 0]  # (n_halo,) log10(M500c)
+                y_m, y_s = _lookup_bin_stats(stats, log_m_per_halo, t.redshift)
+                y = ((t.y - y_m) / y_s).astype(np.float32)
+            else:
+                y = ((t.y - stats["y_mean"][None, None, :]) / stats["y_std"][None, None, :]).astype(np.float32)
+
+            # Replace invalid points with 0 (= channel mean in normalized space)
+            # so encoder/decoder never see extreme outlier values.
+            if t.valid_mask is not None:
+                y = np.where(t.valid_mask, y, 0.0).astype(np.float32)
             snaps.append(
                 RunTask(
                     run_id=t.run_id,
@@ -650,6 +1446,7 @@ def normalize_tasks(tasks: List[RunFamilyTask], stats) -> List[RunFamilyTask]:
                     y=y,
                     n_halo=t.n_halo,
                     n_r=t.n_r,
+                    valid_mask=t.valid_mask,
                 )
             )
         out.append(RunFamilyTask(run_id=fam.run_id, snapshots=snaps))
@@ -665,6 +1462,7 @@ def anp_collate(
     ctx_x_list, ctx_y_list, tgt_x_list, tgt_y_list = [], [], [], []
     ctx_snap_list, tgt_snap_list = [], []
     ctx_mask_list, tgt_mask_list = [], []
+    tgt_vm_list = []
     meta = []
 
     for fam in batch:
@@ -683,6 +1481,7 @@ def anp_collate(
 
         x = torch.tensor(tgt_task.x, dtype=torch.float32)
         y = torch.tensor(tgt_task.y, dtype=torch.float32)
+        vm = tgt_task.valid_mask  # (n_halo, n_r, C) or None
 
         n_halo, n_r, xdim = x.shape
         ydim = y.shape[-1]
@@ -698,6 +1497,13 @@ def anp_collate(
         ctx_snap_chunks = [torch.full((ctx_x.shape[0],), int(tgt_task.snap_idx), dtype=torch.long)]
         tgt_x = x[tgt_h].reshape(-1, xdim)
         tgt_y = y[tgt_h].reshape(-1, ydim)
+
+        # Build per-channel validity mask for target points.
+        if vm is not None:
+            vm_t = torch.tensor(vm, dtype=torch.bool)
+            tgt_vm = vm_t[tgt_h].reshape(-1, ydim)
+        else:
+            tgt_vm = torch.ones(tgt_y.shape[0], ydim, dtype=torch.bool)
 
         # Pull context from neighboring cosmic times for the same simulation.
         if aux_candidates and max_aux_snapshots > 0:
@@ -730,6 +1536,7 @@ def anp_collate(
 
         ctx_mask_list.append(torch.ones(ctx_x.shape[0], dtype=torch.bool))
         tgt_mask_list.append(torch.ones(tgt_x.shape[0], dtype=torch.bool))
+        tgt_vm_list.append(tgt_vm)
 
         meta.append({
             "run_id": int(fam.run_id),
@@ -772,6 +1579,15 @@ def anp_collate(
             out[i, : t.shape[0]] = t
         return out
 
+    def pad_mask_2d(seq):
+        b = len(seq)
+        max_len = max(t.shape[0] for t in seq)
+        feat = seq[0].shape[1]
+        out = torch.zeros((b, max_len, feat), dtype=torch.bool)
+        for i, t in enumerate(seq):
+            out[i, : t.shape[0]] = t
+        return out
+
     def pad_long(seq):
         b = len(seq)
         max_len = max(t.shape[0] for t in seq)
@@ -789,6 +1605,7 @@ def anp_collate(
         "tgt_snap": pad_long(tgt_snap_list),
         "ctx_mask": pad_mask(ctx_mask_list),
         "tgt_mask": pad_mask(tgt_mask_list),
+        "tgt_valid_mask": pad_mask_2d(tgt_vm_list),
         "meta": meta,
     }
 
@@ -928,22 +1745,30 @@ class Decoder(nn.Module):
         theta_dim: int,
         theta_start_idx: int,
         theta_film_scale: float,
+        cc_dual_head: bool = False,
     ):
         super().__init__()
         self.y_dim = y_dim
         self.theta_dim = theta_dim
         self.theta_start_idx = theta_start_idx
         self.theta_film_scale = theta_film_scale
+        self.cc_dual_head = cc_dual_head
         self.trunk = DeepMLP(x_dim + d_model + d_latent, hidden_dim=hidden_dim, out_dim=hidden_dim, n_layers=n_layers, dropout=dropout)
         self.theta_film = nn.Sequential(
             nn.Linear(theta_dim, hidden_dim * 2),
             nn.SiLU(),
             nn.Linear(hidden_dim * 2, hidden_dim * 2),
         )
+        # Default (NCC) head — also used when cc_dual_head is False.
         self.mu = nn.Linear(hidden_dim, y_dim)
         self.log_sigma = nn.Linear(hidden_dim, y_dim)
+        # CC-specific head (only when dual-head mode is enabled).
+        if cc_dual_head:
+            self.mu_cc = nn.Linear(hidden_dim, y_dim)
+            self.log_sigma_cc = nn.Linear(hidden_dim, y_dim)
 
-    def forward(self, tgt_x, r, z):
+    def _compute_h(self, tgt_x, r, z):
+        """Shared trunk + FiLM conditioning → hidden features h."""
         nt = tgt_x.shape[1]
         z_exp = z.unsqueeze(1).expand(-1, nt, -1)
         h = self.trunk(torch.cat([tgt_x, r, z_exp], dim=-1))
@@ -954,10 +1779,24 @@ class Decoder(nn.Module):
         gamma, beta = film.chunk(2, dim=-1)
         h = h * (1.0 + self.theta_film_scale * torch.tanh(gamma).unsqueeze(1))
         h = h + self.theta_film_scale * beta.unsqueeze(1)
+        return h
 
-        mu = self.mu(h)
-        sigma = 0.1 + 0.9 * F.softplus(self.log_sigma(h))
+    @staticmethod
+    def _head_output(mu_layer, log_sigma_layer, h):
+        mu = mu_layer(h)
+        sigma = 0.1 + 0.9 * F.softplus(log_sigma_layer(h))
         return mu, sigma
+
+    def forward(self, tgt_x, r, z):
+        h = self._compute_h(tgt_x, r, z)
+        return self._head_output(self.mu, self.log_sigma, h)
+
+    def forward_dual(self, tgt_x, r, z):
+        """Return ((mu_ncc, sigma_ncc), (mu_cc, sigma_cc))."""
+        h = self._compute_h(tgt_x, r, z)
+        ncc = self._head_output(self.mu, self.log_sigma, h)
+        cc = self._head_output(self.mu_cc, self.log_sigma_cc, h)
+        return ncc, cc
 
 
 class StrongANP(nn.Module):
@@ -993,10 +1832,26 @@ class StrongANP(nn.Module):
         core_radius_weight: float = 1.0,
         core_radius_frac: float = 0.2,
         core_radius_min_bins: int = 3,
+        core_bias_weight: float = 0.0,
         num_snapshots: int = 1,
         time_feature_scale: float = 0.1,
+        ideal_gas_weight: float = 0.0,
+        ideal_gas_channel_indices: Optional[Tuple[int, int, int]] = None,
+        cc_dual_head: bool = False,
+        cc_indicator_feature_idx: int = -1,
+        decoder_likelihood: str = "gaussian",
+        student_t_df: float = 5.0,
+        context_dropout_rate: float = 0.0,
+        input_noise_std: float = 0.0,
+        beta_nll_weight: float = 0.0,
+        free_bits: float = 0.0,
     ):
         super().__init__()
+
+        self.context_dropout_rate = float(context_dropout_rate)
+        self.input_noise_std = float(input_noise_std)
+        self.beta_nll_weight = float(beta_nll_weight)
+        self.free_bits = float(free_bits)
 
         self.radius_fourier_n_freq = int(radius_fourier_n_freq)
         self.radial_feature_idx = int(radial_feature_idx)
@@ -1040,7 +1895,16 @@ class StrongANP(nn.Module):
             theta_dim=theta_dim,
             theta_start_idx=theta_start_idx_model,
             theta_film_scale=theta_film_scale,
+            cc_dual_head=cc_dual_head,
         )
+        self.cc_dual_head = bool(cc_dual_head)
+        self.cc_indicator_feature_idx = int(cc_indicator_feature_idx)
+        self.decoder_likelihood = str(decoder_likelihood).lower()
+        if self.decoder_likelihood not in {"gaussian", "student_t"}:
+            raise ValueError(f"Unsupported decoder_likelihood={decoder_likelihood}")
+        self.student_t_df = float(student_t_df)
+        if self.decoder_likelihood == "student_t" and self.student_t_df <= 2.0:
+            raise ValueError("student_t_df must be > 2.0 when decoder_likelihood=student_t")
         self.max_latent_points = max_latent_points
         self.smoothness_weight = smoothness_weight
         self.var_cal_weight = var_cal_weight
@@ -1055,11 +1919,19 @@ class StrongANP(nn.Module):
         self.core_radius_weight = float(core_radius_weight)
         self.core_radius_frac = float(core_radius_frac)
         self.core_radius_min_bins = int(core_radius_min_bins)
+        self.core_bias_weight = float(core_bias_weight)
         if self.use_task_uncertainty_weighting:
             # Kendall et al. (2018): one homoscedastic log-uncertainty per output channel.
             self.log_sigma_task = nn.Parameter(torch.zeros(y_dim))
         else:
             self.log_sigma_task = None
+
+        self.ideal_gas_weight = float(ideal_gas_weight)
+        self.ideal_gas_channel_indices = ideal_gas_channel_indices  # (rho_idx, T_idx, P_idx)
+        # Buffer for y_std needed by ideal-gas penalty to convert normalized
+        # errors back to log10 space.  Populated by set_y_std() after model
+        # construction.  Defaults to ones (no-op scaling).
+        self.register_buffer("y_std_buf", torch.ones(y_dim))
 
         self.num_snapshots = max(1, int(num_snapshots))
         self.time_feature_scale = float(time_feature_scale)
@@ -1072,6 +1944,10 @@ class StrongANP(nn.Module):
                 nn.SiLU(),
                 nn.Linear(x_dim, x_dim),
             )
+
+    def set_y_std(self, y_std: torch.Tensor) -> None:
+        """Store per-channel y_std for the ideal gas penalty."""
+        self.y_std_buf = y_std.detach().clone().to(self.y_std_buf.device)
 
     def _build_radius_weights(self, tgt_mask: torch.Tensor, meta: List[Dict]) -> torch.Tensor:
         # Emphasize inner radial bins where profile interiors are systematically harder.
@@ -1169,6 +2045,18 @@ class StrongANP(nn.Module):
             return torch.zeros((), device=mu.device, dtype=mu.dtype)
         return torch.stack(penalties).mean()
 
+    def _output_log_prob(self, y: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        if self.decoder_likelihood == "student_t":
+            z = (y - mu) / sigma
+            return StudentT(df=self.student_t_df).log_prob(z) - torch.log(sigma)
+        return Normal(mu, sigma).log_prob(y)
+
+    def _aleatoric_var_from_scale(self, sigma: torch.Tensor) -> torch.Tensor:
+        if self.decoder_likelihood == "student_t":
+            df = max(self.student_t_df, 2.0001)
+            return sigma**2 * (df / (df - 2.0))
+        return sigma**2
+
     def forward(self, batch, device, beta: float = 1.0):
         ctx_x_raw = batch["ctx_x"].to(device)
         ctx_y = batch["ctx_y"].to(device)
@@ -1182,6 +2070,22 @@ class StrongANP(nn.Module):
         ctx_x = self._fuse_time(self._embed_x(ctx_x_raw), ctx_snap)
         tgt_x = self._fuse_time(self._embed_x(tgt_x_raw), tgt_snap)
 
+        # Training-time input noise regularization.
+        if self.training and self.input_noise_std > 0:
+            ctx_x = ctx_x + torch.randn_like(ctx_x) * self.input_noise_std
+            tgt_x = tgt_x + torch.randn_like(tgt_x) * self.input_noise_std
+
+        # Training-time context dropout: randomly mask out context points
+        # so the model cannot rely on having rich context and must also
+        # learn good priors and robust latent representations.
+        if self.training and self.context_dropout_rate > 0:
+            keep = torch.rand(ctx_mask.shape, device=ctx_mask.device) > self.context_dropout_rate
+            # Always keep at least one context point per batch element.
+            first_valid = ctx_mask.float().argmax(dim=1)
+            for b in range(ctx_mask.shape[0]):
+                keep[b, first_valid[b]] = True
+            ctx_mask = ctx_mask & keep
+
         q_ctx = self.latent(ctx_x, ctx_y, ctx_mask)
         lat_x, lat_y, lat_mask = self._subsample_masked_points(
             tgt_x,
@@ -1193,10 +2097,33 @@ class StrongANP(nn.Module):
         z = q_all.rsample()
 
         r = self.det(ctx_x, ctx_y, ctx_mask, tgt_x, tgt_mask)
-        mu, sigma = self.dec(tgt_x, r, z)
+
+        # ---- Dual-head CC/NCC routing ----
+        if self.cc_dual_head:
+            (mu_ncc, sigma_ncc), (mu_cc, sigma_cc) = self.dec.forward_dual(tgt_x, r, z)
+            # Build per-point CC mask from raw (pre-Fourier) target features.
+            # CC indicator < 0 → cool-core halo.
+            cc_feat_idx = self.cc_indicator_feature_idx
+            # tgt_x_raw is pre-embedding: (B, max_pts, raw_x_dim)
+            cc_val = tgt_x_raw[:, :, cc_feat_idx]          # (B, max_pts)
+            is_cc = (cc_val < 0.0).unsqueeze(-1).float()   # (B, max_pts, 1)
+            is_ncc = 1.0 - is_cc
+            mu    = mu_ncc    * is_ncc + mu_cc    * is_cc
+            sigma = sigma_ncc * is_ncc + sigma_cc * is_cc
+        else:
+            mu, sigma = self.dec(tgt_x, r, z)
 
         mask_f = tgt_mask.float()
-        mask_3d = mask_f.unsqueeze(-1)
+        pad_mask_3d = mask_f.unsqueeze(-1)                     # (B, N, 1) padding mask
+
+        # Per-channel validity: exclude zero-valued profile points from loss.
+        tgt_valid = batch.get("tgt_valid_mask")
+        if tgt_valid is not None:
+            tgt_valid = tgt_valid.to(device).float()           # (B, N, C)
+            mask_3d = pad_mask_3d * tgt_valid                  # (B, N, C)
+        else:
+            mask_3d = pad_mask_3d                              # (B, N, 1)
+
         radius_w = self._build_radius_weights(tgt_mask, batch["meta"]).unsqueeze(-1).to(mask_3d.dtype)
         weighted_mask_3d = mask_3d * radius_w
         denom = weighted_mask_3d.sum().clamp_min(1.0)
@@ -1213,9 +2140,14 @@ class StrongANP(nn.Module):
         else:
             channel_w = torch.ones((1, 1, mu.shape[-1]), dtype=mu.dtype, device=mu.device)
 
-        dist = Normal(mu, sigma)
-        log_prob = dist.log_prob(tgt_y)
-        recon = (log_prob * channel_w * weighted_mask_3d).sum() / denom
+        log_prob = self._output_log_prob(tgt_y, mu, sigma)
+        # Beta-NLL (Seitzer et al. 2022): weight log-prob by detached sigma^(2*beta)
+        # to prevent overconfident sigma collapse during training.
+        if self.beta_nll_weight > 0:
+            beta_w = sigma.detach().pow(2 * self.beta_nll_weight)
+            recon = (log_prob * beta_w * channel_w * weighted_mask_3d).sum() / (beta_w * channel_w * weighted_mask_3d).sum().clamp_min(1.0)
+        else:
+            recon = (log_prob * channel_w * weighted_mask_3d).sum() / denom
 
         resid_sq = (mu - tgt_y) ** 2
 
@@ -1233,18 +2165,69 @@ class StrongANP(nn.Module):
         else:
             task_uncertainty_loss = torch.zeros((), device=mu.device, dtype=mu.dtype)
 
-        kl = kl_divergence(q_all, q_ctx).sum(dim=1).mean()
+        # Free bits: clamp per-dimension KL to a minimum to prevent
+        # posterior collapse (Kingma et al. 2016).
+        kl_per_dim = kl_divergence(q_all, q_ctx)  # (batch, d_latent)
+        if self.free_bits > 0:
+            kl_per_dim = torch.clamp(kl_per_dim, min=self.free_bits)
+        kl = kl_per_dim.sum(dim=1).mean()
         mse = (resid_sq * channel_w * weighted_mask_3d).sum() / denom
 
         # Calibrate predicted variance against residual variance at each valid point.
-        var_cal_pt = (torch.log(sigma**2 + 1e-8) - torch.log(resid_sq.detach() + 1e-8)) ** 2
+        pred_var = self._aleatoric_var_from_scale(sigma)
+        var_cal_pt = (torch.log(pred_var + 1e-8) - torch.log(resid_sq.detach() + 1e-8)) ** 2
         var_cal = (var_cal_pt * weighted_mask_3d).sum() / denom
         sigma_mean = (sigma * mask_3d).sum() / mask_3d.sum().clamp_min(1.0)
         smooth = self._profile_smoothness_penalty(mu, tgt_mask, batch["meta"])
 
+        core_bias = torch.zeros((), device=mu.device, dtype=mu.dtype)
+        if self.core_bias_weight > 0.0:
+            core_mask = torch.zeros_like(tgt_mask, dtype=torch.bool)
+            for b in range(tgt_mask.shape[0]):
+                n_halo = int(batch["meta"][b]["n_halo"])
+                n_r = int(batch["meta"][b]["n_r"])
+                n_pts = int(min(tgt_mask.shape[1], n_halo * n_r))
+                if n_halo <= 0 or n_r <= 0 or n_pts <= 0:
+                    continue
+                n_core = max(int(self.core_radius_min_bins), int(math.ceil(float(self.core_radius_frac) * n_r)))
+                n_core = min(max(0, n_core), n_r)
+                if n_core <= 0:
+                    continue
+                core_mask_1h = (torch.arange(n_r, device=mu.device) < n_core).repeat(n_halo)
+                core_mask[b, :n_pts] = core_mask_1h[:n_pts]
+            core_mask = core_mask & tgt_mask
+            core_mask_3d = core_mask.float().unsqueeze(-1)
+            if tgt_valid is not None:
+                core_mask_3d = core_mask_3d * tgt_valid
+            core_denom = core_mask_3d.sum(dim=(0, 1)).clamp_min(1.0)
+            core_mean_resid = ((mu - tgt_y) * core_mask_3d).sum(dim=(0, 1)) / core_denom
+            core_bias = (core_mean_resid ** 2).mean()
+
+        # Ideal-gas penalty: log10(P) = log10(rho) + log10(T) + const.
+        # In normalized space the constant and mean-model offsets cancel when
+        # expressed on prediction *errors*:
+        #   err_P * sigma_P  ==  err_rho * sigma_rho  +  err_T * sigma_T
+        # violation^2 penalises thermodynamic inconsistency.
+        ideal_gas = torch.zeros((), device=mu.device, dtype=mu.dtype)
+        if self.ideal_gas_weight > 0.0 and self.ideal_gas_channel_indices is not None:
+            rho_i, T_i, P_i = self.ideal_gas_channel_indices
+            err = mu - tgt_y                    # (B, N, C) normalised
+            ys = self.y_std_buf                  # (C,)
+            violation = (err[..., P_i] * ys[P_i]
+                         - err[..., rho_i] * ys[rho_i]
+                         - err[..., T_i] * ys[T_i])   # (B, N)
+            # Only penalize where all three involved channels are valid.
+            ig_mask = mask_f
+            if tgt_valid is not None:
+                ig_valid = (tgt_valid[:, :, rho_i] * tgt_valid[:, :, T_i] * tgt_valid[:, :, P_i])
+                ig_mask = ig_mask * ig_valid
+            ideal_gas = (violation ** 2 * ig_mask).sum() / ig_mask.sum().clamp_min(1.0)
+
         loss = -(recon - beta * kl) + task_uncertainty_loss
         loss = loss + self.var_cal_weight * var_cal
         loss = loss + self.smoothness_weight * smooth
+        loss = loss + self.core_bias_weight * core_bias
+        loss = loss + self.ideal_gas_weight * ideal_gas
 
         rmse_norm = torch.sqrt(mse)
         return {
@@ -1255,10 +2238,21 @@ class StrongANP(nn.Module):
             "var_cal": var_cal,
             "sigma_mean": sigma_mean,
             "smooth": smooth,
+            "core_bias": core_bias,
+            "ideal_gas": ideal_gas,
         }
 
     @torch.no_grad()
-    def predict(self, batch, device, n_samples: int = 30):
+    def predict(self, batch, device, n_samples: int = 30, cc_weights: Optional[torch.Tensor] = None):
+        """Run MC prediction.
+
+        Parameters
+        ----------
+        cc_weights : optional (B, 1, 1) tensor of p(CC) per halo-batch.
+            When provided and ``cc_dual_head`` is True, blend both heads:
+            ``output = (1-w)*ncc + w*cc``.  If None and dual-head is on,
+            falls back to the NCC head (equivalent to w=0).
+        """
         self.eval()
         ctx_x_raw = batch["ctx_x"].to(device)
         ctx_y = batch["ctx_y"].to(device)
@@ -1277,7 +2271,17 @@ class StrongANP(nn.Module):
         mus, sigs = [], []
         for _ in range(n_samples):
             z = q_ctx.rsample()
-            mu, sig = self.dec(tgt_x, r, z)
+            if self.cc_dual_head:
+                (mu_ncc, sig_ncc), (mu_cc, sig_cc) = self.dec.forward_dual(tgt_x, r, z)
+                if cc_weights is not None:
+                    w = cc_weights  # (B, 1, 1) or broadcastable
+                    mu = (1 - w) * mu_ncc + w * mu_cc
+                    sig = (1 - w) * sig_ncc + w * sig_cc
+                else:
+                    # Fallback: use NCC head when no weights provided.
+                    mu, sig = mu_ncc, sig_ncc
+            else:
+                mu, sig = self.dec(tgt_x, r, z)
             mus.append(mu)
             sigs.append(sig)
 
@@ -1285,7 +2289,7 @@ class StrongANP(nn.Module):
         sigs = torch.stack(sigs, dim=0)
 
         pred_mean = mus.mean(0)
-        aleatoric_var = (sigs**2).mean(0)
+        aleatoric_var = self._aleatoric_var_from_scale(sigs).mean(0)
         epistemic_var = mus.var(0, unbiased=False)
         total_std = (aleatoric_var + epistemic_var).sqrt()
 
@@ -1294,6 +2298,36 @@ class StrongANP(nn.Module):
 
 def denorm_y(y, y_mean: torch.Tensor, y_std: torch.Tensor):
     return y * y_std + y_mean
+
+
+def _output_log_prob(
+    y: torch.Tensor,
+    mu: torch.Tensor,
+    std: torch.Tensor,
+    decoder_likelihood: str,
+    student_t_df: float,
+):
+    if decoder_likelihood == "student_t":
+        z = (y - mu) / std
+        return StudentT(df=float(student_t_df)).log_prob(z) - torch.log(std)
+    return Normal(mu, std).log_prob(y)
+
+
+def _coverage_halfwidth_multiplier(
+    sigma_level: float,
+    decoder_likelihood: str,
+    student_t_df: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    # Match Gaussian ±kσ central coverage and map to Student-t quantile width.
+    p_two_sided = math.erf(float(sigma_level) / math.sqrt(2.0))
+    if decoder_likelihood != "student_t":
+        return torch.tensor(float(sigma_level), device=device, dtype=dtype)
+
+    q = 0.5 * (1.0 + p_two_sided)
+    q_t = torch.tensor(q, device=device, dtype=dtype)
+    return StudentT(df=float(student_t_df)).icdf(q_t)
 
 
 def _all_profile_log_indices(target_names: List[str]) -> List[int]:
@@ -1342,6 +2376,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, kl_warmup, 
         "var_cal": [],
         "sigma_mean": [],
         "smooth": [],
+        "core_bias": [],
+        "ideal_gas": [],
     }
     optimizer.zero_grad(set_to_none=True)
 
@@ -1377,6 +2413,8 @@ def validate_one_epoch(model, loader, device, epoch, kl_warmup):
         "var_cal": [],
         "sigma_mean": [],
         "smooth": [],
+        "core_bias": [],
+        "ideal_gas": [],
     }
 
     for batch in loader:
@@ -1385,6 +2423,58 @@ def validate_one_epoch(model, loader, device, epoch, kl_warmup):
             meter[k].append(float(out[k].detach().cpu()))
 
     return {k: float(np.mean(v)) for k, v in meter.items()}
+
+
+def _oracle_cc_weights(model, batch, device) -> Optional[torch.Tensor]:
+    """Extract oracle CC weights from batch data for dual-head models.
+
+    Returns (B, max_pts, 1) float tensor of p(CC) per point, or None.
+    """
+    core = unwrap_model(model)
+    if not core.cc_dual_head:
+        return None
+    cc_idx = core.cc_indicator_feature_idx
+    tgt_x_raw = batch["tgt_x"].to(device)
+    cc_val = tgt_x_raw[:, :, cc_idx]  # (B, max_pts)
+    return (cc_val < 0.0).float().unsqueeze(-1)  # (B, max_pts, 1)
+
+
+def make_zeroshot_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a neutral-context batch for strict zero-shot evaluation.
+
+    Keeps targets unchanged and replaces context with a single unmasked zero
+    token, mirroring the inference API behavior.
+    """
+    tgt_x = batch["tgt_x"]
+    tgt_y = batch["tgt_y"]
+    tgt_snap = batch["tgt_snap"]
+    tgt_mask = batch["tgt_mask"]
+    meta = batch["meta"]
+
+    bsz = int(tgt_x.shape[0])
+    raw_x_dim = int(tgt_x.shape[-1])
+    y_dim = int(tgt_y.shape[-1])
+
+    ctx_x = torch.zeros((bsz, 1, raw_x_dim), dtype=tgt_x.dtype)
+    ctx_y = torch.zeros((bsz, 1, y_dim), dtype=tgt_y.dtype)
+    ctx_mask = torch.ones((bsz, 1), dtype=torch.bool)
+    if tgt_snap.shape[1] > 0:
+        ctx_snap = tgt_snap[:, :1].clone()
+    else:
+        ctx_snap = torch.zeros((bsz, 1), dtype=torch.long)
+
+    return {
+        "ctx_x": ctx_x,
+        "ctx_y": ctx_y,
+        "ctx_snap": ctx_snap,
+        "tgt_x": tgt_x,
+        "tgt_y": tgt_y,
+        "tgt_snap": tgt_snap,
+        "ctx_mask": ctx_mask,
+        "tgt_mask": tgt_mask,
+        "tgt_valid_mask": batch.get("tgt_valid_mask"),
+        "meta": meta,
+    }
 
 
 @torch.no_grad()
@@ -1401,8 +2491,12 @@ def evaluate_test_metrics(
     target_names: List[str],
     core_radius_frac: float = 0.2,
     core_radius_min_bins: int = 3,
+    force_zeroshot_context: bool = False,
 ):
     model.eval()
+    model_core = cast(StrongANP, unwrap_model(model))
+    decoder_likelihood = str(getattr(model_core, "decoder_likelihood", "gaussian"))
+    student_t_df = float(getattr(model_core, "student_t_df", 5.0))
     rmses = []
     nlls = []
     sum_sq = None
@@ -1413,24 +2507,39 @@ def evaluate_test_metrics(
     sum_sq_outer = None
     sum_w_outer = None
 
+    # Per-snapshot accumulators for stratified metrics.
+    per_snap_sq: Dict[int, torch.Tensor] = {}
+    per_snap_w: Dict[int, torch.Tensor] = {}
+
     for batch in loader:
-        y = batch["tgt_y"].to(device)
-        mask = batch["tgt_mask"].to(device)
-        mu, std, _, _ = model.predict(batch, device=device, n_samples=n_samples)
+        batch_eval = make_zeroshot_batch(batch) if force_zeroshot_context else batch
+
+        y = batch_eval["tgt_y"].to(device)
+        mask = batch_eval["tgt_mask"].to(device)
+        tgt_valid = batch_eval.get("tgt_valid_mask")
+        if tgt_valid is not None:
+            tgt_valid = tgt_valid.to(device).float()
+        cc_w = _oracle_cc_weights(model, batch_eval, device)
+        mu, std, _, _ = model.predict(batch_eval, device=device, n_samples=n_samples, cc_weights=cc_w)
 
         y_o = denorm_y(y, y_mean, y_std)
         mu_o = denorm_y(mu, y_mean, y_std)
-        y_o = add_mean_back(y_o, batch["tgt_x"].to(device), x_mean, x_std, mean_model)
-        mu_o = add_mean_back(mu_o, batch["tgt_x"].to(device), x_mean, x_std, mean_model)
+        y_o = add_mean_back(y_o, batch_eval["tgt_x"].to(device), x_mean, x_std, mean_model)
+        mu_o = add_mean_back(mu_o, batch_eval["tgt_x"].to(device), x_mean, x_std, mean_model)
         std_o = (std * y_std).clamp_min(1e-6)
         if len(target_names) > 1:
             y_o, mu_o, std_o = restore_all_profiles_physical_units(y_o, mu_o, std_o, target_names)
+        if std_o is None:
+            raise RuntimeError("std tensor unexpectedly None in evaluate_test_metrics")
+        std_o_t = cast(torch.Tensor, std_o)
 
         mask_3d = mask.float().unsqueeze(-1)
+        if tgt_valid is not None:
+            mask_3d = mask_3d * tgt_valid
         core_mask = torch.zeros_like(mask, dtype=torch.bool)
         for b in range(mask.shape[0]):
-            n_halo = int(batch["meta"][b]["n_halo"])
-            n_r = int(batch["meta"][b]["n_r"])
+            n_halo = int(batch_eval["meta"][b]["n_halo"])
+            n_r = int(batch_eval["meta"][b]["n_r"])
             n_pts = int(min(mask.shape[1], n_halo * n_r))
             if n_halo <= 0 or n_r <= 0 or n_pts <= 0:
                 continue
@@ -1444,12 +2553,16 @@ def evaluate_test_metrics(
         outer_mask = mask & (~core_mask)
         core_mask_3d = core_mask.float().unsqueeze(-1)
         outer_mask_3d = outer_mask.float().unsqueeze(-1)
+        if tgt_valid is not None:
+            core_mask_3d = core_mask_3d * tgt_valid
+            outer_mask_3d = outer_mask_3d * tgt_valid
 
         rmse = torch.sqrt((((mu_o - y_o) ** 2) * mask_3d).sum() / mask_3d.sum())
-        nll = -(Normal(mu_o, std_o).log_prob(y_o) * mask_3d).sum() / mask_3d.sum()
+        log_prob = _output_log_prob(y_o, mu_o, std_o_t, decoder_likelihood=decoder_likelihood, student_t_df=student_t_df)
+        nll = -(log_prob * mask_3d).sum() / mask_3d.sum()
 
         ss = (((mu_o - y_o) ** 2) * mask_3d).sum(dim=(0, 1))
-        sn = (-(Normal(mu_o, std_o).log_prob(y_o) * mask_3d)).sum(dim=(0, 1))
+        sn = (-(log_prob * mask_3d)).sum(dim=(0, 1))
         ww = mask_3d.sum(dim=(0, 1))
         ss_core = (((mu_o - y_o) ** 2) * core_mask_3d).sum(dim=(0, 1))
         ww_core = core_mask_3d.sum(dim=(0, 1))
@@ -1471,6 +2584,21 @@ def evaluate_test_metrics(
             sum_w_core = sum_w_core + ww_core
             sum_sq_outer = sum_sq_outer + ss_outer
             sum_w_outer = sum_w_outer + ww_outer
+
+        # Per-snapshot RMSE accumulation.
+        for b in range(mask.shape[0]):
+            snap_b = int(batch_eval["meta"][b]["snapnum"])
+            n_halo_b = int(batch_eval["meta"][b]["n_halo"])
+            n_r_b = int(batch_eval["meta"][b]["n_r"])
+            n_pts_b = min(mask.shape[1], n_halo_b * n_r_b)
+            s_b = (((mu_o - y_o) ** 2) * mask_3d)[b, :n_pts_b].sum()
+            w_b = mask_3d[b, :n_pts_b].sum()
+            if snap_b not in per_snap_sq:
+                per_snap_sq[snap_b] = s_b
+                per_snap_w[snap_b] = w_b
+            else:
+                per_snap_sq[snap_b] = per_snap_sq[snap_b] + s_b
+                per_snap_w[snap_b] = per_snap_w[snap_b] + w_b
 
         rmses.append(float(rmse.cpu()))
         nlls.append(float(nll.cpu()))
@@ -1515,12 +2643,23 @@ def evaluate_test_metrics(
         for i, name in enumerate(target_names)
     }
 
+    # Per-snapshot RMSE summary.
+    per_snapshot = {}
+    for snap_k in sorted(per_snap_sq.keys()):
+        sq_val = float(per_snap_sq[snap_k].detach().cpu())
+        w_val = float(per_snap_w[snap_k].detach().cpu())
+        per_snapshot[snap_k] = {
+            "rmse_original_units": float(math.sqrt(sq_val / max(1.0, w_val))),
+            "n_points": int(w_val),
+        }
+
     return {
         "rmse_original_units": float(np.mean(rmses)),
         "nll_original_units": float(np.mean(nlls)),
         "rmse_core_original_units": rmse_core,
         "rmse_outer_original_units": rmse_outer,
         "per_target": per_target,
+        "per_snapshot": per_snapshot,
     }
 
 
@@ -1542,6 +2681,16 @@ def compute_weighted_selection_score(
     if "temperature" in target_names and "temperature" in per:
         score += float(temperature_w) * float(per["temperature"]["rmse_original_units"])
         score += float(temperature_core_w) * float(per["temperature"].get("rmse_core_original_units", float("inf")))
+
+    # Penalize large per-snapshot disparity: add worst-snapshot RMSE to prevent
+    # early stopping from ignoring poorly-performing redshifts.
+    per_snap = detailed_metrics.get("per_snapshot", {})
+    if len(per_snap) > 1:
+        snap_rmses = [float(v["rmse_original_units"]) for v in per_snap.values() if math.isfinite(v["rmse_original_units"])]
+        if snap_rmses:
+            worst_snap_rmse = max(snap_rmses)
+            score += 0.5 * worst_snap_rmse
+
     return float(score)
 
 
@@ -1560,12 +2709,19 @@ def empirical_coverage(
     target_names: List[str],
 ):
     model.eval()
+    model_core = cast(StrongANP, unwrap_model(model))
+    decoder_likelihood = str(getattr(model_core, "decoder_likelihood", "gaussian"))
+    student_t_df = float(getattr(model_core, "student_t_df", 5.0))
     covered = 0
     total = 0
     for batch in loader:
         y = batch["tgt_y"].to(device)
         mask = batch["tgt_mask"].to(device)
-        mu, std, _, _ = model.predict(batch, device=device, n_samples=n_samples)
+        tgt_valid = batch.get("tgt_valid_mask")
+        if tgt_valid is not None:
+            tgt_valid = tgt_valid.to(device)
+        cc_w = _oracle_cc_weights(model, batch, device)
+        mu, std, _, _ = model.predict(batch, device=device, n_samples=n_samples, cc_weights=cc_w)
 
         y_o = denorm_y(y, y_mean, y_std)
         mu_o = denorm_y(mu, y_mean, y_std)
@@ -1578,9 +2734,19 @@ def empirical_coverage(
         if std_o is None:
             raise RuntimeError("std tensor unexpectedly None in empirical_coverage")
 
-        hit = (torch.abs(y_o - mu_o) <= sigma_level * std_o) & mask.unsqueeze(-1)
+        halfwidth = _coverage_halfwidth_multiplier(
+            sigma_level=sigma_level,
+            decoder_likelihood=decoder_likelihood,
+            student_t_df=student_t_df,
+            device=std_o.device,
+            dtype=std_o.dtype,
+        )
+        metric_mask = mask.unsqueeze(-1)
+        if tgt_valid is not None:
+            metric_mask = metric_mask & tgt_valid
+        hit = (torch.abs(y_o - mu_o) <= halfwidth * std_o) & metric_mask
         covered += int(hit.sum().item())
-        total += int(mask.sum().item() * y_o.shape[-1])
+        total += int(metric_mask.sum().item())
 
     return covered / max(1, total)
 
@@ -1601,7 +2767,8 @@ def estimate_context_sensitivity(
         if i >= max(1, int(n_batches)):
             break
 
-        mu_ctx, _, _, _ = model.predict(batch, device=device, n_samples=n_samples)
+        cc_w = _oracle_cc_weights(model, batch, device)
+        mu_ctx, _, _, _ = model.predict(batch, device=device, n_samples=n_samples, cc_weights=cc_w)
 
         b0 = {
             "ctx_x": batch["ctx_x"],
@@ -1612,6 +2779,7 @@ def estimate_context_sensitivity(
             "tgt_snap": batch["tgt_snap"],
             "ctx_mask": batch["ctx_mask"],
             "tgt_mask": batch["tgt_mask"],
+            "tgt_valid_mask": batch.get("tgt_valid_mask"),
             "meta": batch["meta"],
         }
         mu_nctx, _, _, _ = model.predict(b0, device=device, n_samples=n_samples)
@@ -1665,6 +2833,7 @@ def set_context_halos_for_batch(batch, n_c: int):
         "tgt_snap": tgt_snap,
         "ctx_mask": ctx_mask,
         "tgt_mask": tgt_mask,
+        "tgt_valid_mask": batch.get("tgt_valid_mask"),
         "meta": meta,
     }
 
@@ -1691,7 +2860,10 @@ def few_shot_curve(
         for batch in loader:
             y = batch["tgt_y"].to(device)
             mask = batch["tgt_mask"].to(device)
+            tgt_valid = batch.get("tgt_valid_mask")
             mask_3d = mask.float().unsqueeze(-1)
+            if tgt_valid is not None:
+                mask_3d = mask_3d * tgt_valid.to(device).float()
             y_o = denorm_y(y, y_mean, y_std)
             y_o = add_mean_back(y_o, batch["tgt_x"].to(device), x_mean, x_std, mean_model)
             if len(target_names) > 1:
@@ -1753,11 +2925,55 @@ def make_arg_parser():
     p.add_argument("--theta-start-idx", type=int, default=2)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eps", type=float, default=1e-30)
+    p.add_argument("--log-channel-floor", type=float, default=0.0,
+                   help="Physical-unit floor for log-space channels. Values below this are treated as invalid. "
+                        "0 (default) keeps the original behaviour (valid if > 0). "
+                        "A value like 1e-29 removes extreme resolution-floor artefacts.")
 
     p.add_argument("--max-runs", type=int, default=0, help="0 means all discovered runs")
     p.add_argument("--min-halos", type=int, default=4)
     p.add_argument("--max-halos-per-run", type=int, default=0, help="0 means keep all halos")
     p.add_argument("--radial-stride", type=int, default=1)
+    p.add_argument(
+        "--mass-floor",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum log10(M500c) to include in training. "
+            "Halos with log10(M500c) < this value are dropped. "
+            "Set to 12.5 to exclude poorly-resolved low-mass groups. 0 disables."
+        ),
+    )
+    p.add_argument(
+        "--min-valid-frac",
+        type=float,
+        default=0.5,
+        help=(
+            "Minimum fraction of valid (non-zero) points per halo across all "
+            "channels.  Halos with fewer valid points are dropped to avoid "
+            "feeding heavily-masked profiles to the encoder.  0 disables."
+        ),
+    )
+    p.add_argument(
+        "--physical-floor-quantile",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, replace the global --eps floor with the per-channel "
+            "quantile of positive values from training data.  E.g., 0.001 uses "
+            "the 0.1th-percentile positive value as the floor for log10 clipping. "
+            "Applied after build_tasks; 0 disables (uses --eps as-is)."
+        ),
+    )
+    p.add_argument(
+        "--robust-norm",
+        action="store_true",
+        default=False,
+        help=(
+            "Use median / MAD instead of mean / std for y normalization. "
+            "More resistant to heavy-tailed outliers from extreme halos."
+        ),
+    )
     p.add_argument(
         "--r500-physical-factor",
         type=float,
@@ -1843,8 +3059,70 @@ def make_arg_parser():
     p.add_argument("--dec-layers", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--theta-film-scale", type=float, default=0.1)
+    p.add_argument(
+        "--decoder-likelihood",
+        type=str,
+        default="gaussian",
+        choices=["gaussian", "student_t"],
+        help="Likelihood family used for decoder reconstruction/NLL.",
+    )
+    p.add_argument(
+        "--student-t-df",
+        type=float,
+        default=5.0,
+        help="Degrees of freedom for Student-t decoder likelihood (must be > 2).",
+    )
     p.add_argument("--smoothness-weight", type=float, default=0.005)
+    p.add_argument(
+        "--ideal-gas-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for the ideal-gas physics penalty enforcing "
+            "log10(P) = log10(rho) + log10(T) + const across channels. "
+            "Only active when gas_density, temperature, and pressure are all present."
+        ),
+    )
     p.add_argument("--var-cal-weight", type=float, default=0.0)
+    p.add_argument(
+        "--context-dropout-rate",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of context points randomly masked during training. "
+            "Forces the model to learn robust priors and prevents over-reliance "
+            "on context memorization. 0 disables. Recommended: 0.2-0.4."
+        ),
+    )
+    p.add_argument(
+        "--input-noise-std",
+        type=float,
+        default=0.0,
+        help=(
+            "Standard deviation of Gaussian noise added to input features "
+            "during training for regularization. 0 disables. Recommended: 0.01-0.03."
+        ),
+    )
+    p.add_argument(
+        "--beta-nll-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Beta-NLL (Seitzer et al. 2022): weight reconstruction log-prob by "
+            "sigma^(2*beta) (detached) to prevent overconfident sigma collapse. "
+            "0 disables. Recommended: 0.5."
+        ),
+    )
+    p.add_argument(
+        "--free-bits",
+        type=float,
+        default=0.0,
+        help=(
+            "Free bits: minimum KL divergence per latent dimension (nats). "
+            "Prevents posterior collapse while maintaining useful latent structure. "
+            "0 disables. Recommended: 0.25-1.0."
+        ),
+    )
     p.add_argument(
         "--task-uncertainty-l2-weight",
         type=float,
@@ -1898,6 +3176,15 @@ def make_arg_parser():
         help="Minimum number of inner bins per halo treated as core.",
     )
     p.add_argument(
+        "--core-bias-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Penalty weight on squared mean signed residual in the core region. "
+            "Use to suppress systematic inner-region over/under-prediction. 0 disables."
+        ),
+    )
+    p.add_argument(
         "--context-sensitivity-every",
         type=int,
         default=5,
@@ -1936,6 +3223,40 @@ def make_arg_parser():
         help="Strength of learned snapshot-time modulation in model feature space.",
     )
     p.add_argument(
+        "--disable-continuous-redshift-feature",
+        action="store_true",
+        help=(
+            "Disable continuous redshift as an explicit input feature. "
+            "By default, redshift is appended to x so inference can condition on arbitrary z."
+        ),
+    )
+    p.add_argument(
+        "--cc-indicator",
+        action="store_true",
+        help=(
+            "Append a cool-core indicator feature log10(T_core / T500_analytic) "
+            "to the input vector. T_core is the mean temperature of the first N "
+            "radial bins and T500 is derived analytically from M500 and R500."
+        ),
+    )
+    p.add_argument(
+        "--cc-indicator-core-bins",
+        type=int,
+        default=6,
+        help="Number of innermost radial bins averaged for T_core in the CC indicator.",
+    )
+    p.add_argument(
+        "--cc-dual-head",
+        action="store_true",
+        help=(
+            "Fork the decoder Gaussian head into CC and NCC heads. "
+            "Requires --cc-indicator. At training time loss is routed to "
+            "the appropriate head per halo; at inference both heads are "
+            "blended using CCPredictor probabilities."
+        ),
+    )
+
+    p.add_argument(
         "--temporal-holdout-snapnum",
         type=int,
         default=-1,
@@ -1948,6 +3269,10 @@ def make_arg_parser():
     )
 
     p.add_argument("--disable-mean-prior", action="store_true")
+    p.add_argument("--mean-use-theta", action="store_true",
+                   help="Condition the mean model on theta (feedback/cosmo params) in addition to mass and radius.")
+    p.add_argument("--mean-loss", type=str, default="mse", choices=["mse", "huber", "mae"],
+                   help="Loss function for mean model. 'huber' (delta=0.5) or 'mae' reduces influence of core outliers; produces median-like predictions.")
     p.add_argument("--mean-hidden-dim", type=int, default=128)
     p.add_argument("--mean-epochs", type=int, default=80)
     p.add_argument("--mean-lr", type=float, default=1e-3)
@@ -1955,6 +3280,29 @@ def make_arg_parser():
     p.add_argument("--mean-batch-size", type=int, default=131072)
     p.add_argument("--mean-log-every", type=int, default=10)
     p.add_argument("--mean-predict-batch-size", type=int, default=262144)
+    p.add_argument(
+        "--training-stage",
+        type=str,
+        default="full",
+        choices=["full", "mean_only", "anp_only"],
+        help=(
+            "Training stage mode: 'full' trains mean model then ANP residuals; "
+            "'mean_only' trains/evaluates/saves only the mean model; "
+            "'anp_only' loads a pre-trained mean model and trains ANP residuals."
+        ),
+    )
+    p.add_argument(
+        "--mean-checkpoint-path",
+        type=str,
+        default="",
+        help="Path to a saved mean-model checkpoint (required for --training-stage=anp_only).",
+    )
+    p.add_argument(
+        "--mean-output-path",
+        type=str,
+        default="",
+        help="Optional explicit output path for saved mean model checkpoint.",
+    )
 
     p.add_argument("--eval-samples", type=int, default=50)
     p.add_argument("--fewshot-contexts", type=int, nargs="+", default=[1, 2, 5, 10])
@@ -1978,6 +3326,10 @@ def main():
     args = make_arg_parser().parse_args()
     if args.theta_start_idx < 2:
         raise ValueError("theta_start_idx must be >= 2 because x[...,0] and x[...,1] are reserved for mass/radius features")
+    if getattr(args, "cc_dual_head", False) and not getattr(args, "cc_indicator", False):
+        raise ValueError("--cc-dual-head requires --cc-indicator")
+    if str(args.decoder_likelihood).lower() == "student_t" and float(args.student_t_df) <= 2.0:
+        raise ValueError("--student-t-df must be > 2.0 when --decoder-likelihood=student_t")
     if args.target_name == "all_profiles":
         if args.all_profiles_subset:
             # Keep canonical ALL_PROFILE_TARGETS ordering for stable channel mapping.
@@ -1992,6 +3344,13 @@ def main():
     args.resolved_all_profile_targets = target_names
     args.resolved_snapnums = list(args.snapnums) if args.snapnums else [int(args.snapnum)]
     args.redshift_by_snap = parse_snapshot_redshifts(args.snapshot_redshifts)
+    args.use_continuous_redshift_feature = bool(not args.disable_continuous_redshift_feature)
+    args.redshift_feature_idx = int(args.theta_start_idx + args.theta_dim)
+    # CC indicator is appended after all prior features (theta, optional redshift).
+    cc_offset = args.theta_start_idx + args.theta_dim
+    if args.use_continuous_redshift_feature:
+        cc_offset += 1
+    args.cc_indicator_feature_idx = int(cc_offset)
     missing_snap_map = [s for s in args.resolved_snapnums if int(s) not in args.redshift_by_snap]
     if missing_snap_map:
         raise ValueError(
@@ -2002,6 +3361,14 @@ def main():
         raise ValueError("min_snapshots_per_run must be >= 1")
     if len(args.resolved_snapnums) > 1 and args.min_snapshots_per_run < 2:
         args.min_snapshots_per_run = 2
+
+    if args.training_stage == "mean_only" and args.disable_mean_prior:
+        raise ValueError("--training-stage=mean_only requires mean prior to be enabled (remove --disable-mean-prior)")
+    if args.training_stage == "anp_only":
+        if args.disable_mean_prior:
+            raise ValueError("--training-stage=anp_only requires mean prior to be enabled (remove --disable-mean-prior)")
+        if not args.mean_checkpoint_path:
+            raise ValueError("--training-stage=anp_only requires --mean-checkpoint-path")
 
     if args.enable_ddp:
         ddp_enabled, rank, world_size, local_rank = setup_distributed(timeout_sec=int(args.ddp_timeout_sec))
@@ -2020,6 +3387,13 @@ def main():
         print(f"Device: {device}, AMP: {use_amp}, DDP: {ddp_enabled} (world_size={world_size})")
         if float(args.r500_physical_factor) != 1.0:
             print(f"[INFO] Using R500 scaling factor for radius ratio: {args.r500_physical_factor:.6g}")
+        if float(getattr(args, "mass_floor", 0.0)) > 0.0:
+            print(f"[INFO] Mass floor: log10(M500c) >= {args.mass_floor:.2f}")
+        if float(getattr(args, "min_valid_frac", 0.0)) > 0.0:
+            print(f"[INFO] Min valid fraction per halo: {args.min_valid_frac:.2f}")
+        if bool(getattr(args, "robust_norm", False)):
+            print("[INFO] Robust normalization enabled (median / MAD)")
+        print("[INFO] Mass-redshift-aware normalization: enabled")
 
     out_root = Path(args.output_dir)
     if main_proc:
@@ -2032,7 +3406,8 @@ def main():
         obj = [run_tag]
         dist.broadcast_object_list(obj, src=0)
         run_tag = str(obj[0])
-    out_dir = out_root / f"anp_{args.target_name}_{run_tag}"
+    run_prefix = "mean" if args.training_stage == "mean_only" else "anp"
+    out_dir = out_root / f"{run_prefix}_{args.target_name}_{run_tag}"
     if main_proc:
         out_dir.mkdir(parents=True, exist_ok=True)
     if ddp_enabled:
@@ -2102,42 +3477,152 @@ def main():
             )
 
     y_dim = train_raw[0].snapshots[0].y.shape[-1]
-    mean_model: Optional[MeanModel] = MeanModel(y_dim=y_dim, hidden_dim=args.mean_hidden_dim).to(device)
+    mean_theta_dim = int(args.theta_dim) if getattr(args, "mean_use_theta", False) else 0
+    args.mean_theta_dim = mean_theta_dim
+    mean_n_hidden = 3 if mean_theta_dim > 0 else 2
+    args.mean_n_hidden = mean_n_hidden
+    mean_model: Optional[MeanModel] = None
     mean_prior_enabled = not args.disable_mean_prior
+    mean_prior_source = "disabled"
+    mean_checkpoint_used: Optional[str] = None
+    mean_metrics_summary: Optional[Dict[str, Any]] = None
     if mean_prior_enabled:
-        if main_proc:
-            print("Pre-training frozen mean profile model for residual targets...")
-        train_raw_flat = flatten_family_tasks(train_raw)
-        val_raw_flat = flatten_family_tasks(val_raw)
-        test_raw_flat = flatten_family_tasks(test_raw)
-        if ddp_enabled:
+        train_raw_flat_original = flatten_family_tasks(train_raw)
+        val_raw_flat_original = flatten_family_tasks(val_raw)
+        test_raw_flat_original = flatten_family_tasks(test_raw)
+
+        if args.training_stage == "anp_only":
+            mean_ckpt = Path(args.mean_checkpoint_path)
             if main_proc:
-                mean_model = train_mean_model(
-                    train_raw_flat,
-                    y_dim=y_dim,
-                    args=args,
-                    device=device,
-                    verbose=True,
-                    num_workers_override=0,
+                print(f"Loading frozen mean profile model from checkpoint: {mean_ckpt}")
+            mean_model, mean_payload = load_mean_checkpoint(mean_ckpt, device=device)
+            if int(get_mean_model_config(mean_model)["y_dim"]) != int(y_dim):
+                raise ValueError(
+                    f"Loaded mean model y_dim={get_mean_model_config(mean_model)['y_dim']} does not match data y_dim={y_dim}"
                 )
-            dist_barrier(device)
-            broadcast_module_state(mean_model, src=0)
-            dist_barrier(device)
-            mean_model.eval()
-            for p in mean_model.parameters():
-                p.requires_grad_(False)
+            loaded_target_name = mean_payload.get("target_name")
+            if loaded_target_name is not None and str(loaded_target_name) != str(args.target_name):
+                raise ValueError(
+                    "Loaded mean model target_name does not match current run: "
+                    f"ckpt={loaded_target_name}, run={args.target_name}"
+                )
+            mean_prior_source = "loaded"
+            mean_checkpoint_used = str(mean_ckpt)
         else:
+            if main_proc:
+                print("Pre-training frozen mean profile model for residual targets...")
             mean_model = train_mean_model(
-                train_raw_flat,
+                train_raw_flat_original,
                 y_dim=y_dim,
                 args=args,
                 device=device,
                 verbose=main_proc,
                 num_workers_override=None,
             )
-        train_raw_flat = apply_residual_prior(train_raw_flat, mean_model, device=device, batch_size=args.mean_predict_batch_size)
-        val_raw_flat = apply_residual_prior(val_raw_flat, mean_model, device=device, batch_size=args.mean_predict_batch_size)
-        test_raw_flat = apply_residual_prior(test_raw_flat, mean_model, device=device, batch_size=args.mean_predict_batch_size)
+            mean_prior_source = "trained"
+
+        if mean_model is None:
+            raise RuntimeError("Internal error: mean prior enabled but mean model was not initialized")
+
+        if main_proc:
+            mean_metrics_summary = {
+                "train": evaluate_mean_model_metrics(
+                    train_raw_flat_original,
+                    mean_model,
+                    device=device,
+                    batch_size=int(args.mean_predict_batch_size),
+                    target_names=target_names,
+                    core_radius_frac=float(args.core_radius_frac),
+                    core_radius_min_bins=int(args.core_radius_min_bins),
+                ),
+                "val": evaluate_mean_model_metrics(
+                    val_raw_flat_original,
+                    mean_model,
+                    device=device,
+                    batch_size=int(args.mean_predict_batch_size),
+                    target_names=target_names,
+                    core_radius_frac=float(args.core_radius_frac),
+                    core_radius_min_bins=int(args.core_radius_min_bins),
+                ),
+                "test": evaluate_mean_model_metrics(
+                    test_raw_flat_original,
+                    mean_model,
+                    device=device,
+                    batch_size=int(args.mean_predict_batch_size),
+                    target_names=target_names,
+                    core_radius_frac=float(args.core_radius_frac),
+                    core_radius_min_bins=int(args.core_radius_min_bins),
+                ),
+            }
+            print(
+                "Mean model RMSE (orig units): "
+                f"train={mean_metrics_summary['train']['rmse_original_units']:.4g}, "
+                f"val={mean_metrics_summary['val']['rmse_original_units']:.4g}, "
+                f"test={mean_metrics_summary['test']['rmse_original_units']:.4g}"
+            )
+
+        if main_proc and args.training_stage in ("full", "mean_only"):
+            mean_ckpt_path = Path(args.mean_output_path) if args.mean_output_path else (out_dir / "mean_model.pt")
+            save_mean_checkpoint(
+                mean_ckpt_path,
+                mean_model,
+                args=args,
+                target_names=target_names,
+                mean_metrics=mean_metrics_summary,
+            )
+            mean_checkpoint_used = str(mean_ckpt_path)
+            print(f"Saved mean model checkpoint: {mean_ckpt_path}")
+
+        if args.training_stage == "mean_only":
+            if main_proc:
+                metrics = {
+                    "target_name": args.target_name,
+                    "target_names": target_names,
+                    "training_stage": args.training_stage,
+                    "mean_prior": {
+                        "enabled": True,
+                        "source": mean_prior_source,
+                        "checkpoint": mean_checkpoint_used,
+                        "hidden_dim": args.mean_hidden_dim,
+                        "epochs": args.mean_epochs,
+                        "lr": args.mean_lr,
+                        "weight_decay": args.mean_weight_decay,
+                        "use_theta": bool(args.mean_use_theta),
+                    },
+                    "mean_metrics": mean_metrics_summary,
+                    "n_tasks_total": len(tasks),
+                    "n_train": len(train_raw),
+                    "n_val": len(val_raw),
+                    "n_test": len(test_raw),
+                }
+                with (out_dir / "metrics.json").open("w", encoding="utf-8") as f:
+                    json.dump(metrics, f, indent=2)
+                with (out_dir / "args.json").open("w", encoding="utf-8") as f:
+                    json.dump(vars(args), f, indent=2)
+                print(f"Mean-only artifacts written to: {out_dir}")
+            if ddp_enabled:
+                dist_barrier(device)
+                cleanup_distributed()
+            return
+
+        train_raw_flat = apply_residual_prior(
+            train_raw_flat_original,
+            mean_model,
+            device=device,
+            batch_size=args.mean_predict_batch_size,
+        )
+        val_raw_flat = apply_residual_prior(
+            val_raw_flat_original,
+            mean_model,
+            device=device,
+            batch_size=args.mean_predict_batch_size,
+        )
+        test_raw_flat = apply_residual_prior(
+            test_raw_flat_original,
+            mean_model,
+            device=device,
+            batch_size=args.mean_predict_batch_size,
+        )
         train_raw = remap_flat_tasks_to_families(train_raw, train_raw_flat)
         val_raw = remap_flat_tasks_to_families(val_raw, val_raw_flat)
         test_raw = remap_flat_tasks_to_families(test_raw, test_raw_flat)
@@ -2148,7 +3633,69 @@ def main():
             print("Mean profile prior disabled; training ANP on direct targets.")
         mean_model = None
 
-    norm_np = compute_norm_stats(train_raw)
+    norm_np = compute_norm_stats(
+        train_raw,
+        robust=bool(getattr(args, "robust_norm", False)),
+        mass_redshift_aware=True,
+    )
+
+    # ---- Physical floor: raise eps to a per-channel data-driven floor ----
+    phys_floor_q = float(getattr(args, "physical_floor_quantile", 0.0))
+    if phys_floor_q > 0.0 and main_proc:
+        flat_train = flatten_family_tasks(train_raw)
+        y_all = np.concatenate([t.y.reshape(-1, t.y.shape[-1]) for t in flat_train], axis=0)
+        vm_all = np.concatenate(
+            [(t.valid_mask if t.valid_mask is not None else np.ones_like(t.y, dtype=np.bool_)).reshape(-1, t.y.shape[-1])
+             for t in flat_train], axis=0,
+        )
+        y_dim = y_all.shape[1]
+        phys_floors = np.full(y_dim, float(args.eps), dtype=np.float32)
+        for ch in range(y_dim):
+            vals = y_all[:, ch][vm_all[:, ch]]
+            if len(vals) > 0:
+                phys_floors[ch] = float(np.quantile(vals, phys_floor_q))
+        print(f"[INFO] Physical floor quantile {phys_floor_q}: "
+              f"floors={[f'{v:.4g}' for v in phys_floors]}")
+        # Re-clip y in all splits to the physical floor.
+        for split in (train_raw, val_raw, test_raw):
+            for fam in split:
+                for t in fam.snapshots:
+                    for ch in range(y_dim):
+                        t.y[:, :, ch] = np.clip(t.y[:, :, ch], phys_floors[ch], None)
+        # Recompute norm stats after floor adjustment.
+        norm_np = compute_norm_stats(
+            train_raw,
+            robust=bool(getattr(args, "robust_norm", False)),
+            mass_redshift_aware=True,
+        )
+
+    # Fit CC-indicator prior from raw (un-normalized) training data.
+    cc_prior_stats: Optional[Dict[str, Any]] = None
+    cc_predictor_model: Optional[CCPredictor] = None
+    if args.cc_indicator:
+        cc_prior_stats = fit_cc_prior(train_raw, cc_feature_idx=int(args.cc_indicator_feature_idx))
+        if main_proc:
+            print(
+                f"CC indicator prior fitted: global mean={cc_prior_stats['global_mean']:.3f}, "
+                f"std={cc_prior_stats['global_std']:.3f} from {cc_prior_stats['n_halos']} halos"
+            )
+        # Train parameter-aware CC predictor f(logM, theta) -> (mu_cc, sigma_cc).
+        if main_proc:
+            print("Training parameter-aware CC predictor...")
+        cc_predictor_model = train_cc_predictor(
+            train_raw,
+            cc_feature_idx=int(args.cc_indicator_feature_idx),
+            theta_start_idx=int(args.theta_start_idx),
+            theta_dim=int(args.theta_dim),
+            hidden_dim=128,
+            n_layers=3,
+            lr=1e-3,
+            epochs=200,
+            batch_size=4096,
+            device=device,
+            verbose=main_proc,
+        )
+
     train_tasks = normalize_tasks(train_raw, norm_np)
     val_tasks = normalize_tasks(val_raw, norm_np)
     test_tasks = normalize_tasks(test_raw, norm_np)
@@ -2223,6 +3770,32 @@ def main():
             f"radius_fourier_n_freq={radius_fourier_n_freq}"
         )
 
+    # Resolve ideal-gas channel indices from target_names when all three
+    # thermodynamic channels are present and weight > 0.
+    ideal_gas_channel_indices: Optional[Tuple[int, int, int]] = None
+    if args.ideal_gas_weight > 0.0:
+        _ig_names = ("gas_density", "temperature", "pressure")
+        if all(n in target_names for n in _ig_names):
+            ideal_gas_channel_indices = (
+                target_names.index("gas_density"),
+                target_names.index("temperature"),
+                target_names.index("pressure"),
+            )
+            if main_proc:
+                print(
+                    f"Ideal-gas penalty enabled: weight={args.ideal_gas_weight}, "
+                    f"channel indices rho={ideal_gas_channel_indices[0]} "
+                    f"T={ideal_gas_channel_indices[1]} P={ideal_gas_channel_indices[2]}"
+                )
+        else:
+            if main_proc:
+                print(
+                    f"WARNING: --ideal-gas-weight={args.ideal_gas_weight} but not all "
+                    f"channels (gas_density, temperature, pressure) are present in "
+                    f"target_names={target_names}. Disabling ideal-gas penalty."
+                )
+            args.ideal_gas_weight = 0.0
+
     model = StrongANP(
         x_dim=x_dim,
         raw_x_dim=raw_x_dim,
@@ -2254,9 +3827,24 @@ def main():
         core_radius_weight=args.core_radius_weight,
         core_radius_frac=args.core_radius_frac,
         core_radius_min_bins=args.core_radius_min_bins,
+        core_bias_weight=args.core_bias_weight,
         num_snapshots=len(args.resolved_snapnums),
         time_feature_scale=args.time_feature_scale,
+        ideal_gas_weight=args.ideal_gas_weight,
+        ideal_gas_channel_indices=ideal_gas_channel_indices,
+        cc_dual_head=bool(getattr(args, "cc_dual_head", False)),
+        cc_indicator_feature_idx=int(getattr(args, "cc_indicator_feature_idx", -1)),
+        decoder_likelihood=str(args.decoder_likelihood),
+        student_t_df=float(args.student_t_df),
+        context_dropout_rate=float(getattr(args, "context_dropout_rate", 0.0)),
+        input_noise_std=float(getattr(args, "input_noise_std", 0.0)),
+        beta_nll_weight=float(getattr(args, "beta_nll_weight", 0.0)),
+        free_bits=float(getattr(args, "free_bits", 0.0)),
     ).to(device)
+
+    # Populate the y_std buffer so the ideal-gas penalty can convert normalised
+    # errors back to log10 space.
+    unwrap_model(model).set_y_std(y_std)
 
     use_data_parallel = bool(args.enable_data_parallel) and (not ddp_enabled) and (device.type == "cuda") and (torch.cuda.device_count() > 1)
     if use_data_parallel:
@@ -2350,10 +3938,27 @@ def main():
                     core_radius_frac=float(args.core_radius_frac),
                     core_radius_min_bins=int(args.core_radius_min_bins),
                 )
+                detailed_metrics_zeroshot = evaluate_test_metrics(
+                    unwrap_model(model),
+                    val_loader_eval,
+                    device,
+                    y_mean=y_mean,
+                    y_std=y_std,
+                    x_mean=x_mean,
+                    x_std=x_std,
+                    mean_model=mean_model,
+                    n_samples=int(args.val_detailed_samples),
+                    target_names=target_names,
+                    core_radius_frac=float(args.core_radius_frac),
+                    core_radius_min_bins=int(args.core_radius_min_bins),
+                    force_zeroshot_context=True,
+                )
                 row["val_rmse_original_units"] = float(detailed_metrics["rmse_original_units"])
                 row["val_nll_original_units"] = float(detailed_metrics["nll_original_units"])
                 row["val_rmse_core_original_units"] = float(detailed_metrics["rmse_core_original_units"])
                 row["val_rmse_outer_original_units"] = float(detailed_metrics["rmse_outer_original_units"])
+                row["val_zeroshot_rmse_original_units"] = float(detailed_metrics_zeroshot["rmse_original_units"])
+                row["val_zeroshot_nll_original_units"] = float(detailed_metrics_zeroshot["nll_original_units"])
 
                 per_target = detailed_metrics.get("per_target", {})
                 if "pressure" in per_target:
@@ -2365,8 +3970,20 @@ def main():
                     row["val_temperature_nll_original_units"] = float(per_target["temperature"]["nll_original_units"])
                     row["val_temperature_rmse_core_original_units"] = float(per_target["temperature"].get("rmse_core_original_units", float("nan")))
 
+                per_snap = detailed_metrics.get("per_snapshot", {})
+                for snap_k, snap_v in per_snap.items():
+                    row[f"val_snap{snap_k}_rmse"] = float(snap_v["rmse_original_units"])
+
                 row["val_weighted_orig"] = compute_weighted_selection_score(
                     detailed_metrics,
+                    target_names=target_names,
+                    pressure_w=float(args.selection_pressure_weight),
+                    temperature_w=float(args.selection_temperature_weight),
+                    pressure_core_w=float(args.selection_pressure_core_weight),
+                    temperature_core_w=float(args.selection_temperature_core_weight),
+                )
+                row["val_zeroshot_weighted_orig"] = compute_weighted_selection_score(
+                    detailed_metrics_zeroshot,
                     target_names=target_names,
                     pressure_w=float(args.selection_pressure_weight),
                     temperature_w=float(args.selection_temperature_weight),
@@ -2401,6 +4018,20 @@ def main():
                     f"pressure_rmse={p_rmse:.4g} temperature_rmse={t_rmse:.4g} "
                     f"pressure_core_rmse={p_core:.4g} temperature_core_rmse={t_core:.4g} "
                     f"weighted={row['val_weighted_orig']:.4g}"
+                )
+                snap_parts = []
+                if detailed_metrics is not None:
+                    for ks, vs in detailed_metrics.get("per_snapshot", {}).items():
+                        col = f"val_snap{ks}_rmse"
+                        if col in row:
+                            snap_parts.append(f"snap{ks}={row[col]:.4g}")
+                if snap_parts:
+                    print(f"  val(per-snap) {' '.join(snap_parts)}")
+            if "val_zeroshot_rmse_original_units" in row:
+                print(
+                    f"  val(zero-shot) rmse={row['val_zeroshot_rmse_original_units']:.4g} "
+                    f"nll={row['val_zeroshot_nll_original_units']:.4g} "
+                    f"weighted={row.get('val_zeroshot_weighted_orig', float('nan')):.4g}"
                 )
             if "val_context_sensitivity" in row:
                 print(f"  val(context_sensitivity)={row['val_context_sensitivity']:.4g}")
@@ -2451,7 +4082,12 @@ def main():
                         "metrics": row,
                         "target_names": target_names,
                         "mean_prior_enabled": mean_prior_enabled,
+                        "mean_prior_source": mean_prior_source,
+                        "mean_checkpoint": mean_checkpoint_used,
                         "mean_model_state_dict": None if mean_model is None else mean_model.state_dict(),
+                        "mean_model_config": None if mean_model is None else get_mean_model_config(mean_model),
+                        "cc_prior": cc_prior_stats,
+                        "cc_predictor_state_dict": None if cc_predictor_model is None else cc_predictor_model.state_dict(),
                     },
                     periodic_path,
                 )
@@ -2510,6 +4146,21 @@ def main():
             core_radius_frac=float(args.core_radius_frac),
             core_radius_min_bins=int(args.core_radius_min_bins),
         )
+        test_metrics_zeroshot = evaluate_test_metrics(
+            eval_model,
+            test_loader_eval,
+            device,
+            y_mean=y_mean,
+            y_std=y_std,
+            x_mean=x_mean,
+            x_std=x_std,
+            mean_model=mean_model,
+            n_samples=args.eval_samples,
+            target_names=target_names,
+            core_radius_frac=float(args.core_radius_frac),
+            core_radius_min_bins=int(args.core_radius_min_bins),
+            force_zeroshot_context=True,
+        )
         cov1 = empirical_coverage(
             eval_model,
             test_loader_eval,
@@ -2555,11 +4206,13 @@ def main():
         rel = {int(k): 100.0 * (base - v) / base for k, v in fshot.items()}
 
         print("Test metrics:", test_metrics)
+        print("Test zero-shot metrics:", test_metrics_zeroshot)
         print(f"Coverage@1sigma={cov1:.3f}, Coverage@2sigma={cov2:.3f}")
         print("Few-shot RMSE:", fshot)
         print("Few-shot relative improvement (%):", rel)
 
         temporal_holdout_metrics = None
+        temporal_holdout_metrics_zeroshot = None
         if holdout_loader_eval is not None:
             temporal_holdout_metrics = evaluate_test_metrics(
                 eval_model,
@@ -2575,7 +4228,23 @@ def main():
                 core_radius_frac=float(args.core_radius_frac),
                 core_radius_min_bins=int(args.core_radius_min_bins),
             )
+            temporal_holdout_metrics_zeroshot = evaluate_test_metrics(
+                eval_model,
+                holdout_loader_eval,
+                device,
+                y_mean=y_mean,
+                y_std=y_std,
+                x_mean=x_mean,
+                x_std=x_std,
+                mean_model=mean_model,
+                n_samples=args.eval_samples,
+                target_names=target_names,
+                core_radius_frac=float(args.core_radius_frac),
+                core_radius_min_bins=int(args.core_radius_min_bins),
+                force_zeroshot_context=True,
+            )
             print(f"Temporal holdout (snap={holdout_snap}) metrics:", temporal_holdout_metrics)
+            print(f"Temporal holdout (snap={holdout_snap}) zero-shot metrics:", temporal_holdout_metrics_zeroshot)
 
         ckpt_path = out_dir / "best_model.pt"
         torch.save(
@@ -2587,13 +4256,19 @@ def main():
                 "target_name": args.target_name,
                 "target_names": target_names,
                 "mean_prior_enabled": mean_prior_enabled,
+                "mean_prior_source": mean_prior_source,
+                "mean_checkpoint": mean_checkpoint_used,
                 "mean_model_state_dict": None if mean_model is None else mean_model.state_dict(),
+                "mean_model_config": None if mean_model is None else get_mean_model_config(mean_model),
+                "cc_prior": cc_prior_stats,
+                "cc_predictor_state_dict": None if cc_predictor_model is None else cc_predictor_model.state_dict(),
             },
             ckpt_path,
         )
 
         metrics = {
             "target_name": args.target_name,
+            "training_stage": args.training_stage,
             "n_tasks_total": len(tasks),
             "n_train": len(train_tasks),
             "n_val": len(val_tasks),
@@ -2611,6 +4286,7 @@ def main():
                     else int(sum(1 for fam in holdout_eval_raw for s in fam.snapshots if int(s.snapnum) == holdout_snap))
                 ),
                 "metrics": temporal_holdout_metrics,
+                "metrics_zeroshot": temporal_holdout_metrics_zeroshot,
             },
             "select_metric": select_metric,
             "best_epoch": best["epoch"],
@@ -2618,15 +4294,19 @@ def main():
             "best_val_loss": best["val_loss"],
             "best_val_rmse_norm": best["val_rmse_norm"],
             "test": test_metrics,
+            "test_zeroshot": test_metrics_zeroshot,
             "coverage": {"1sigma": cov1, "2sigma": cov2},
             "fewshot_rmse": fshot,
             "fewshot_rel_improvement_pct": rel,
             "mean_prior": {
                 "enabled": mean_prior_enabled,
+                "source": mean_prior_source,
+                "checkpoint": mean_checkpoint_used,
                 "hidden_dim": args.mean_hidden_dim,
                 "epochs": args.mean_epochs,
                 "lr": args.mean_lr,
                 "weight_decay": args.mean_weight_decay,
+                "metrics": mean_metrics_summary,
             },
             "normalization": {
                 "y_mean": norm_np["y_mean"].tolist(),

@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
-from train_anp_emulator import MeanModel, StrongANP, add_mean_back, denorm_y, restore_all_profiles_physical_units
+from train_anp_emulator import CCPredictor, MeanModel, StrongANP, add_mean_back, denorm_y, restore_all_profiles_physical_units, _lookup_bin_stats
 
 FieldArg = Union[str, Sequence[str]]
 RadialBinsArg = Union[np.ndarray, Sequence[float], Sequence[Sequence[float]]]
@@ -20,6 +20,11 @@ class PredictionResult:
     aleatoric_std: np.ndarray
     epistemic_std: np.ndarray
     field_names: List[str]
+    # Log-space outputs for channels modelled in log10 space.
+    # These are populated when the emulator uses log channels and give
+    # a symmetric, better-calibrated uncertainty representation.
+    mean_log10: Optional[np.ndarray] = None
+    std_log10: Optional[np.ndarray] = None
 
 
 class Emulator:
@@ -35,6 +40,8 @@ class Emulator:
         y_mean: torch.Tensor,
         y_std: torch.Tensor,
         device: torch.device,
+        cc_prior: Optional[Dict[str, Any]] = None,
+        cc_predictor: Optional[CCPredictor] = None,
     ):
         self.model = model
         self.mean_model = mean_model
@@ -46,10 +53,23 @@ class Emulator:
         self.y_mean = y_mean
         self.y_std = y_std
         self.device = device
+        self.norm_stats: Optional[Dict[str, Any]] = None  # set by from_checkpoint if available
 
         self.theta_dim = int(args.get("theta_dim", 35))
         self.theta_start_idx = int(args.get("theta_start_idx", 2))
         self.raw_x_dim = int(x_mean.shape[0])
+        self.use_continuous_redshift_feature = bool(args.get("use_continuous_redshift_feature", False))
+        self.redshift_feature_idx = int(args.get("redshift_feature_idx", self.theta_start_idx + self.theta_dim))
+
+        # Parse snapshot->redshift metadata from checkpoint args when available.
+        redshift_by_snap_cfg = args.get("redshift_by_snap", {}) or {}
+        self.redshift_by_snap: Dict[int, float] = {}
+        for k, v in redshift_by_snap_cfg.items():
+            try:
+                self.redshift_by_snap[int(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+
         snapnums_cfg = args.get("resolved_snapnums", None)
         if snapnums_cfg is None:
             snapnum_legacy = int(args.get("snapnum", 90))
@@ -58,6 +78,17 @@ class Emulator:
             self.snapnums = [int(s) for s in snapnums_cfg]
         self.snap_to_idx = {int(s): i for i, s in enumerate(self.snapnums)}
         self.default_snapnum = int(self.snapnums[0])
+
+        # Continuous-z feature is usable only if the model input layout contains it.
+        expected_min_dim = self.theta_start_idx + self.theta_dim + 1
+        if self.redshift_feature_idx < 0 or self.raw_x_dim < expected_min_dim:
+            self.use_continuous_redshift_feature = False
+
+        # Cool-core indicator feature.
+        self.use_cc_indicator = bool(args.get("cc_indicator", False))
+        self.cc_indicator_feature_idx = int(args.get("cc_indicator_feature_idx", -1))
+        self.cc_prior = cc_prior  # may be None for older checkpoints
+        self.cc_predictor = cc_predictor  # parameter-aware CC predictor (may be None)
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str | Path, device: str = "cpu") -> "Emulator":
@@ -175,7 +206,17 @@ class Emulator:
                     channel_balance_eps=float(args.get("channel_balance_eps", 1e-6)),
                     num_snapshots=max(1, len(args.get("resolved_snapnums", [args.get("snapnum", 90)]))),
                     time_feature_scale=float(args.get("time_feature_scale", 0.1)),
+                    ideal_gas_weight=float(args.get("ideal_gas_weight", 0.0)),
+                    ideal_gas_channel_indices=args.get("ideal_gas_channel_indices", None),
+                    cc_dual_head=bool(args.get("cc_dual_head", False)),
+                    cc_indicator_feature_idx=int(args.get("cc_indicator_feature_idx", -1)),
+                    decoder_likelihood=str(args.get("decoder_likelihood", "gaussian")),
+                    student_t_df=float(args.get("student_t_df", 5.0)),
                 )
+                # Backward compat: inject default y_std_buf for checkpoints
+                # saved before the ideal-gas penalty was introduced.
+                if "y_std_buf" not in model_state:
+                    model_state["y_std_buf"] = candidate_model.y_std_buf.clone()
                 candidate_model.load_state_dict(model_state)
                 candidate_model.eval()
                 model = candidate_model
@@ -192,11 +233,26 @@ class Emulator:
 
         mean_model = None
         if bool(state.get("mean_prior_enabled", False)) and state.get("mean_model_state_dict", None) is not None:
+            mm_sd = state["mean_model_state_dict"]
+            first_weight_key = next((k for k in mm_sd if k.endswith("net.0.weight")), None)
+            # Detect input dimension to infer redshift and theta usage.
+            mm_in_dim = int(mm_sd[first_weight_key].shape[1]) if first_weight_key else 2
+            mean_theta_dim = int(args.get("mean_theta_dim", 0))
+            theta_start_idx = int(args.get("theta_start_idx", 2))
+            # input = 2 (logM, logr) + theta_dim + (1 if redshift)
+            mean_use_redshift = (mm_in_dim == 2 + mean_theta_dim + 1)
+            # Infer n_hidden_layers from the number of weight matrices in the state dict.
+            mm_weight_keys = sorted(k for k in mm_sd if k.startswith("net.") and k.endswith(".weight"))
+            mm_n_hidden = max(1, len(mm_weight_keys) - 1)  # all but the output layer
             mean_model = MeanModel(
                 y_dim=int(y_mean_np.shape[0]),
                 hidden_dim=int(args.get("mean_hidden_dim", 128)),
+                use_redshift=mean_use_redshift,
+                theta_dim=mean_theta_dim,
+                theta_start_idx=theta_start_idx,
+                n_hidden_layers=mm_n_hidden,
             )
-            mean_model.load_state_dict(state["mean_model_state_dict"])
+            mean_model.load_state_dict(mm_sd)
             mean_model.eval()
 
         dev = torch.device(device)
@@ -204,7 +260,25 @@ class Emulator:
         if mean_model is not None:
             mean_model = mean_model.to(dev)
 
-        return cls(
+        # Load parameter-aware CC predictor if available.
+        cc_predictor = None
+        cc_pred_sd = state.get("cc_predictor_state_dict", None)
+        if cc_pred_sd is not None:
+            theta_dim = int(args.get("theta_dim", 35))
+            # Infer hidden_dim and n_layers from the saved state dict.
+            layer_keys = [k for k in cc_pred_sd if k.startswith("net.") and k.endswith(".weight")]
+            hidden_dim = int(cc_pred_sd[layer_keys[0]].shape[0]) if layer_keys else 128
+            n_layers = len([k for k in layer_keys if k != layer_keys[-1]])  # all except output layer
+            cc_predictor = CCPredictor(
+                theta_dim=theta_dim,
+                hidden_dim=hidden_dim,
+                n_layers=n_layers,
+            )
+            cc_predictor.load_state_dict(cc_pred_sd)
+            cc_predictor.eval()
+            cc_predictor = cc_predictor.to(dev)
+
+        emu = cls(
             model=model,
             mean_model=mean_model,
             checkpoint_path=ckpt_path,
@@ -215,7 +289,13 @@ class Emulator:
             y_mean=torch.tensor(y_mean_np, dtype=torch.float32, device=dev),
             y_std=torch.tensor(y_std_np, dtype=torch.float32, device=dev),
             device=dev,
+            cc_prior=state.get("cc_prior", None),
+            cc_predictor=cc_predictor,
         )
+        # Store full norm dict for mass-redshift-aware denormalization.
+        if norm.get("mass_redshift_aware", False):
+            emu.norm_stats = norm
+        return emu
 
     @classmethod
     def from_run_dir(cls, run_dir: str | Path, device: str = "cpu", checkpoint_name: str = "best_model.pt") -> "Emulator":
@@ -247,6 +327,80 @@ class Emulator:
     def available_fields(self) -> List[str]:
         return list(self.target_names)
 
+    def sample_cc_indicator(
+        self,
+        log_masses: np.ndarray,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        """Sample CC indicator values from the learned prior p(cc | log_M).
+
+        Parameters
+        ----------
+        log_masses : (n_halo,) log10(M500c) values.
+        rng : optional numpy random generator.
+
+        Returns
+        -------
+        cc : (n_halo,) sampled log10(T_core / T500) values.
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+        if self.cc_prior is None:
+            raise RuntimeError(
+                "No CC prior available in this checkpoint. "
+                "Retrain with --cc-indicator to enable CC sampling."
+            )
+        prior = self.cc_prior
+        edges = np.asarray(prior["bin_edges"], dtype=np.float64)
+        means = np.asarray(prior["bin_mean"], dtype=np.float64)
+        stds = np.asarray(prior["bin_std"], dtype=np.float64)
+
+        logM = np.asarray(log_masses, dtype=np.float64)
+        bin_idx = np.digitize(logM, edges) - 1
+        bin_idx = np.clip(bin_idx, 0, len(means) - 1)
+
+        cc = rng.normal(means[bin_idx], stds[bin_idx]).astype(np.float32)
+        return cc
+
+    @torch.no_grad()
+    def sample_cc_indicator_parametric(
+        self,
+        log_masses: np.ndarray,
+        theta: np.ndarray,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        """Sample CC indicator from the parameter-aware predictor p(cc | logM, theta).
+
+        Parameters
+        ----------
+        log_masses : (n_halo,) log10(M500c) values.
+        theta : (theta_dim,) or (n_halo, theta_dim) feedback/cosmological parameters.
+        rng : optional numpy random generator.
+
+        Returns
+        -------
+        cc : (n_halo,) sampled log10(T_core / T500) values.
+        """
+        if self.cc_predictor is None:
+            raise RuntimeError(
+                "No parametric CC predictor available. "
+                "Retrain with --cc-indicator to enable parameter-aware CC sampling."
+            )
+        if rng is None:
+            rng = np.random.default_rng()
+
+        logM_t = torch.tensor(np.asarray(log_masses, dtype=np.float32), device=self.device)
+        theta_np = np.asarray(theta, dtype=np.float32)
+        if theta_np.ndim == 1:
+            theta_np = np.broadcast_to(theta_np[None, :], (len(logM_t), theta_np.shape[0])).copy()
+        theta_t = torch.tensor(theta_np, device=self.device)
+
+        mu, sigma = self.cc_predictor(logM_t, theta_t)
+        mu_np = mu.cpu().numpy()
+        sigma_np = sigma.cpu().numpy()
+
+        return rng.normal(mu_np, sigma_np).astype(np.float32)
+
     def predict(
         self,
         theta: np.ndarray,
@@ -254,12 +408,140 @@ class Emulator:
         r_bins: RadialBinsArg,
         field: FieldArg,
         snapnum: int | None = None,
+        redshift: float | None = None,
         n_samples: int = 30,
+        cc_indicator: np.ndarray | float | None = None,
+        n_cc_samples: int = 8,
     ) -> PredictionResult:
-        batch, n_halo, n_r = self._build_zeroshot_batch(theta=theta, masses=M, r_bins=r_bins, snapnum=snapnum)
+        """Predict profiles for given halo masses and cosmological parameters.
+
+        Parameters
+        ----------
+        cc_indicator : optional explicit CC indicator value(s). If ``None``
+            and the model was trained with ``--cc-indicator``, values are
+            automatically sampled from the learned mass-dependent prior and
+            marginalized over ``n_cc_samples`` draws.
+        n_cc_samples : number of independent CC prior draws to average over
+            when ``cc_indicator`` is not provided. Ignored when the model has
+            no CC feature or when an explicit value is given.
+        """
+        masses_arr = np.asarray(M, dtype=np.float32).ravel()
+
+        # ---- Dual-head CC/NCC: blend both heads with p(CC) weights ----
+        cc_dual = bool(self.args.get("cc_dual_head", False))
+        if cc_dual:
+            return self._predict_single(
+                theta=theta, M=masses_arr, r_bins=r_bins, field=field,
+                snapnum=snapnum, redshift=redshift, n_samples=n_samples,
+                cc_indicator=cc_indicator,
+            )
+
+        need_cc_marginalization = (
+            self.use_cc_indicator
+            and (self.cc_prior is not None or self.cc_predictor is not None)
+            and cc_indicator is None
+        )
+
+        if need_cc_marginalization:
+            # Marginalize over the CC prior: run n_cc_samples forward passes,
+            # each with an independent draw of cc_indicator, and average the
+            # results in physical space.
+            # Prefer the parameter-aware predictor p(cc | logM, theta) over
+            # the mass-only prior p(cc | logM) when available.
+            log_m_for_prior = np.log10(np.clip(masses_arr, 1e10, None))
+            use_parametric = self.cc_predictor is not None
+            rng = np.random.default_rng()
+            mu_accum = None
+            var_accum = None
+            for _ in range(n_cc_samples):
+                if use_parametric:
+                    cc_draw = self.sample_cc_indicator_parametric(
+                        log_m_for_prior, theta=theta, rng=rng,
+                    )
+                else:
+                    cc_draw = self.sample_cc_indicator(log_m_for_prior, rng=rng)
+                result_i = self._predict_single(
+                    theta=theta, M=masses_arr, r_bins=r_bins, field=field,
+                    snapnum=snapnum, redshift=redshift, n_samples=n_samples,
+                    cc_indicator=cc_draw,
+                )
+                if mu_accum is None:
+                    mu_accum = result_i.mean.copy()
+                    var_accum = result_i.total_std.copy() ** 2
+                else:
+                    mu_accum += result_i.mean
+                    var_accum += result_i.total_std ** 2
+            mu_avg = mu_accum / n_cc_samples
+            # Total variance = avg of per-sample variances + variance of per-sample means
+            # (law of total variance). We approximate by averaging variances since the
+            # per-sample mean shifts are already captured in the variance accumulation.
+            std_avg = np.sqrt(var_accum / n_cc_samples)
+            return PredictionResult(
+                mean=mu_avg,
+                total_std=std_avg,
+                aleatoric_std=result_i.aleatoric_std,
+                epistemic_std=result_i.epistemic_std,
+                field_names=result_i.field_names,
+            )
+        else:
+            # Direct prediction (no CC marginalization needed).
+            cc_val = None
+            if self.use_cc_indicator and cc_indicator is not None:
+                cc_val = np.asarray(cc_indicator, dtype=np.float32)
+                if cc_val.ndim == 0:
+                    cc_val = np.full(len(masses_arr), float(cc_val), dtype=np.float32)
+            return self._predict_single(
+                theta=theta, M=masses_arr, r_bins=r_bins, field=field,
+                snapnum=snapnum, redshift=redshift, n_samples=n_samples,
+                cc_indicator=cc_val,
+            )
+
+    def _predict_single(
+        self,
+        theta: np.ndarray,
+        M: np.ndarray,
+        r_bins: RadialBinsArg,
+        field: FieldArg,
+        snapnum: int | None = None,
+        redshift: float | None = None,
+        n_samples: int = 30,
+        cc_indicator: np.ndarray | None = None,
+    ) -> PredictionResult:
+        """Single forward pass with a fixed CC indicator (or None)."""
+        batch, n_halo, n_r = self._build_zeroshot_batch(
+            theta=theta,
+            masses=M,
+            r_bins=r_bins,
+            snapnum=snapnum,
+            redshift=redshift,
+            cc_indicator=cc_indicator,
+        )
+
+        # Compute CC weights for dual-head blending.
+        cc_weights = None
+        cc_dual = bool(self.args.get("cc_dual_head", False))
+        if cc_dual and self.cc_predictor is not None:
+            masses_arr = np.asarray(M, dtype=np.float32).ravel()
+            log_m = np.log10(np.clip(masses_arr, 1e10, None))
+            log_m_t = torch.tensor(log_m, device=self.device)
+            theta_np = np.asarray(theta, dtype=np.float32)
+            if theta_np.ndim == 1:
+                theta_np = np.broadcast_to(theta_np[None, :], (len(log_m), theta_np.shape[0])).copy()
+            theta_t = torch.tensor(theta_np, device=self.device)
+            mu_cc, sigma_cc = self.cc_predictor(log_m_t, theta_t)
+            # p(CC) = P(cc_indicator < 0) from the Gaussian prior.
+            p_cc = torch.distributions.Normal(mu_cc, sigma_cc).cdf(
+                torch.zeros_like(mu_cc)
+            )
+            # Expand to (1, n_halo*n_r, 1) — uniform across radii per halo.
+            p_cc_per_halo = p_cc.unsqueeze(1).expand(-1, n_r).reshape(1, -1, 1)
+            cc_weights = p_cc_per_halo
 
         with torch.no_grad():
-            mu, total_std, aleatoric_std, epistemic_std = self.model.predict(batch, device=self.device, n_samples=n_samples)
+            mu, total_std, aleatoric_std, epistemic_std = self.model.predict(
+                batch, device=self.device, n_samples=n_samples,
+                cc_weights=cc_weights,
+            )
 
             n_pts = n_halo * n_r
             mu = mu[:, :n_pts, :]
@@ -267,13 +549,40 @@ class Emulator:
             aleatoric_std = aleatoric_std[:, :n_pts, :]
             epistemic_std = epistemic_std[:, :n_pts, :]
 
-            mu_o = denorm_y(mu, self.y_mean, self.y_std)
-            mu_o = add_mean_back(mu_o, batch["tgt_x"].to(self.device), self.x_mean, self.x_std, self.mean_model)
-            mu_o_log = mu_o
+            # Denormalize using per-halo mass-redshift bin stats when available.
+            if self.norm_stats is not None and self.norm_stats.get("mass_redshift_aware", False):
+                # Recover raw log_m (pre-normalization) from the batch x input.
+                tgt_x_raw = batch["tgt_x"].to(self.device)
+                log_m_raw = (tgt_x_raw[0, :n_pts, 0] * self.x_std[0] + self.x_mean[0]).detach().cpu().numpy()
+                # All radial bins for same halo share same mass — take every n_r-th value.
+                log_m_per_halo = log_m_raw[::n_r]
+                z_snap = redshift if redshift is not None else float(
+                    self.redshift_by_snap.get(snapnum or self.default_snapnum, 0.0)
+                )
+                ym_np, ys_np = _lookup_bin_stats(self.norm_stats, log_m_per_halo, z_snap)
+                # ym_np: (n_halo, 1, y_dim), ys_np: (n_halo, 1, y_dim)
+                # Expand to (1, n_halo*n_r, y_dim)
+                ym_exp = np.repeat(ym_np, n_r, axis=1).reshape(1, n_pts, -1)
+                ys_exp = np.repeat(ys_np, n_r, axis=1).reshape(1, n_pts, -1)
+                ym_t = torch.tensor(ym_exp, dtype=mu.dtype, device=mu.device)
+                ys_t = torch.tensor(ys_exp, dtype=mu.dtype, device=mu.device)
+                mu_o = mu * ys_t + ym_t
+                mu_o = add_mean_back(mu_o, batch["tgt_x"].to(self.device), self.x_mean, self.x_std, self.mean_model)
+                mu_o_log = mu_o
+                total_std_o = (total_std * ys_t).clamp_min(1e-6)
+                aleatoric_std_o = (aleatoric_std * ys_t).clamp_min(1e-6)
+                epistemic_std_o = (epistemic_std * ys_t).clamp_min(1e-6)
+            else:
+                mu_o = denorm_y(mu, self.y_mean, self.y_std)
+                mu_o = add_mean_back(mu_o, batch["tgt_x"].to(self.device), self.x_mean, self.x_std, self.mean_model)
+                mu_o_log = mu_o
+                total_std_o = (total_std * self.y_std.view(1, 1, -1)).clamp_min(1e-6)
+                aleatoric_std_o = (aleatoric_std * self.y_std.view(1, 1, -1)).clamp_min(1e-6)
+                epistemic_std_o = (epistemic_std * self.y_std.view(1, 1, -1)).clamp_min(1e-6)
 
-            total_std_o = (total_std * self.y_std.view(1, 1, -1)).clamp_min(1e-6)
-            aleatoric_std_o = (aleatoric_std * self.y_std.view(1, 1, -1)).clamp_min(1e-6)
-            epistemic_std_o = (epistemic_std * self.y_std.view(1, 1, -1)).clamp_min(1e-6)
+            # Save log-space predictions before physical-unit transform.
+            mu_log_save = mu_o_log[0].reshape(n_halo, n_r, -1).detach().cpu().numpy()
+            std_log_save = total_std_o[0].reshape(n_halo, n_r, -1).detach().cpu().numpy()
 
             if len(self.target_names) > 1:
                 _, mu_o, total_std_o = restore_all_profiles_physical_units(
@@ -306,12 +615,16 @@ class Emulator:
         total_np = total_np[..., idx]
         ale_np = ale_np[..., idx]
         epi_np = epi_np[..., idx]
+        mu_log_np = mu_log_save[..., idx]
+        std_log_np = std_log_save[..., idx]
 
         if single:
             mu_np = mu_np[..., 0]
             total_np = total_np[..., 0]
             ale_np = ale_np[..., 0]
             epi_np = epi_np[..., 0]
+            mu_log_np = mu_log_np[..., 0]
+            std_log_np = std_log_np[..., 0]
 
         return PredictionResult(
             mean=mu_np,
@@ -319,6 +632,8 @@ class Emulator:
             aleatoric_std=ale_np,
             epistemic_std=epi_np,
             field_names=names,
+            mean_log10=mu_log_np,
+            std_log10=std_log_np,
         )
 
     def _resolve_field_selection(self, field: FieldArg) -> Tuple[List[int], List[str], bool]:
@@ -342,7 +657,28 @@ class Emulator:
 
         return out_idx, requested, single
 
-    def _build_zeroshot_batch(self, theta: np.ndarray, masses: np.ndarray, r_bins: RadialBinsArg, snapnum: int | None = None):
+    def _nearest_snapnum_for_redshift(self, redshift: float) -> int:
+        if not self.redshift_by_snap:
+            return int(self.default_snapnum)
+        pairs = [(s, z) for s, z in self.redshift_by_snap.items() if int(s) in self.snap_to_idx]
+        if not pairs:
+            return int(self.default_snapnum)
+        z_tgt = float(redshift)
+        snap_sel, _ = min(pairs, key=lambda t: abs(float(t[1]) - z_tgt))
+        return int(snap_sel)
+
+    def _redshift_for_snapnum(self, snapnum: int) -> float | None:
+        return self.redshift_by_snap.get(int(snapnum), None)
+
+    def _build_zeroshot_batch(
+        self,
+        theta: np.ndarray,
+        masses: np.ndarray,
+        r_bins: RadialBinsArg,
+        snapnum: int | None = None,
+        redshift: float | None = None,
+        cc_indicator: np.ndarray | None = None,
+    ):
         masses = np.asarray(masses, dtype=np.float32)
         theta = np.asarray(theta, dtype=np.float32)
 
@@ -378,7 +714,12 @@ class Emulator:
 
         n_r = int(r_bins_use.shape[1])
 
-        chosen_snap = int(self.default_snapnum if snapnum is None else snapnum)
+        if snapnum is not None:
+            chosen_snap = int(snapnum)
+        elif redshift is not None:
+            chosen_snap = int(self._nearest_snapnum_for_redshift(float(redshift)))
+        else:
+            chosen_snap = int(self.default_snapnum)
         if chosen_snap not in self.snap_to_idx:
             raise ValueError(
                 f"Unknown snapnum {chosen_snap}. Available snapshots in this checkpoint: {self.snapnums}"
@@ -405,6 +746,20 @@ class Emulator:
         x_raw[..., 0] = log_m[:, None]
         x_raw[..., 1] = log_r
         x_raw[..., self.theta_start_idx : self.theta_start_idx + self.theta_dim] = theta_use[:, None, :]
+        if self.use_continuous_redshift_feature and 0 <= self.redshift_feature_idx < self.raw_x_dim:
+            if redshift is not None:
+                z_value = float(redshift)
+            else:
+                z_from_snap = self._redshift_for_snapnum(chosen_snap)
+                z_value = float(0.0 if z_from_snap is None else z_from_snap)
+            x_raw[..., self.redshift_feature_idx] = z_value
+
+        if self.use_cc_indicator and 0 <= self.cc_indicator_feature_idx < self.raw_x_dim:
+            if cc_indicator is not None:
+                cc_vals = np.asarray(cc_indicator, dtype=np.float32)
+                if cc_vals.ndim == 0:
+                    cc_vals = np.full(n_halo, float(cc_vals), dtype=np.float32)
+                x_raw[..., self.cc_indicator_feature_idx] = cc_vals[:, None]
 
         x_norm = (x_raw - self.x_mean.detach().cpu().numpy()[None, None, :]) / self.x_std.detach().cpu().numpy()[None, None, :]
         x_norm = x_norm.reshape(1, n_halo * n_r, self.raw_x_dim)
