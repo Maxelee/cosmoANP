@@ -1,0 +1,20 @@
+# Data & training outputs (keep local only)
+Profiles_cy/
+anp_training_runs/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# PDFs / papers
+*.pdf
+
+# OS & editor
+.DS_Store
+*.swp
+*.swo
+*~
