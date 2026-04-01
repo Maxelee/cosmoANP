@@ -258,6 +258,74 @@ class MeanModel(nn.Module):
         return self.net(torch.cat(parts, dim=-1))
 
 
+class PerSnapshotMeanModel(nn.Module):
+    """Wrapper holding a separate MeanModel per snapshot (redshift).
+
+    Interface-compatible with MeanModel so that ``apply_residual_prior``,
+    ``predict_mean_from_raw_x``, ``add_mean_back``, and the inference API
+    work unchanged.
+
+    Keys stored as ``"z0p00"`` etc. inside ``nn.ModuleDict`` (dots are not
+    allowed).  The public interface uses clean float-string keys like ``"0.00"``.
+    """
+
+    @staticmethod
+    def _sanitize_key(z_key: str) -> str:
+        return "z" + z_key.replace(".", "p")
+
+    def __init__(self, models: Dict[str, "MeanModel"], z_tolerance: float = 0.05):
+        super().__init__()
+        sanitized = {self._sanitize_key(k): v for k, v in models.items()}
+        self.snapshot_models = nn.ModuleDict(sanitized)
+        # Map clean key <-> sanitized key
+        self.z_keys = sorted(models.keys())
+        self._key_map = {k: self._sanitize_key(k) for k in self.z_keys}
+        self.z_values = [float(k) for k in self.z_keys]
+        self.z_tolerance = z_tolerance
+        first = next(iter(models.values()))
+        self.theta_dim = first.theta_dim
+        self.theta_start_idx = first.theta_start_idx
+        # Expose use_redshift=True so callers pass redshift to us for routing.
+        self.use_redshift = True
+        # Build a fake `net` attribute so get_mean_model_config can read y_dim.
+        self.net = first.net
+
+    def get_model(self, z_key: str) -> "MeanModel":
+        """Get sub-model by clean key like '0.00'."""
+        return self.snapshot_models[self._key_map[z_key]]
+
+    def _find_model(self, z_val: float) -> Optional["MeanModel"]:
+        for key, z in zip(self.z_keys, self.z_values):
+            if abs(z - z_val) < self.z_tolerance:
+                return self.snapshot_models[self._key_map[key]]
+        return None  # unmatched z (e.g. padding positions)
+
+    def forward(
+        self,
+        log_m: torch.Tensor,
+        log_r: torch.Tensor,
+        theta: Optional[torch.Tensor] = None,
+        redshift: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if redshift is None:
+            raise ValueError("PerSnapshotMeanModel requires redshift input")
+        y_dim = self.net[-1].out_features
+        out = torch.zeros(*log_m.shape, y_dim, device=log_m.device, dtype=log_m.dtype)
+        unique_z = torch.unique(redshift)
+        for z_val in unique_z:
+            model = self._find_model(z_val.item())
+            if model is None:
+                continue  # padding or unseen redshift → leave zeros
+            mask = (redshift - z_val).abs() < self.z_tolerance
+            out[mask] = model(
+                log_m[mask],
+                log_r[mask],
+                theta=theta[mask] if theta is not None else None,
+                redshift=None,
+            )
+        return out
+
+
 def _flatten_mean_training_data(
     tasks: List[RunTask],
     include_redshift: bool = False,
@@ -312,6 +380,29 @@ def train_mean_model(
     x = torch.from_numpy(x_np)
     y = torch.from_numpy(y_np)
 
+    # Build per-sample snapshot-balancing weights so each redshift contributes
+    # equally to the mean-model loss regardless of data volume.
+    snapshot_balanced = bool(getattr(args, "snapshot_balanced_loss", False)) and multi_snap
+    if snapshot_balanced:
+        z_col_idx = x_np.shape[1] - 1  # redshift is the last column
+        z_vals = x_np[:, z_col_idx]
+        unique_z_arr, inv_idx, z_counts = np.unique(
+            np.round(z_vals, 4), return_inverse=True, return_counts=True
+        )
+        n_snaps = len(unique_z_arr)
+        # weight_i = n_snaps / count(z_i)  →  each snapshot sums to n_snaps
+        w_np = (float(n_snaps) / z_counts[inv_idx].astype(np.float32))
+        w_np *= float(len(z_vals)) / float(w_np.sum())  # renormalize to mean=1
+        sample_w = torch.from_numpy(w_np)
+        if verbose:
+            # Show the effective per-sample weight after renormalization.
+            renorm = float(len(z_vals)) / float(n_snaps)
+            for zi, cnt in zip(unique_z_arr, z_counts):
+                eff_w = renorm / float(cnt)
+                print(f"  Mean model snapshot balance: z={zi:.2f}  n={cnt}  weight={eff_w:.4f}")
+    else:
+        sample_w = torch.ones(x.shape[0], dtype=torch.float32)
+
     # Balance channels with very different scales (critical for all_profiles).
     # Without this, large-amplitude targets dominate the mean-prior fit and
     # small-amplitude channels (e.g., pressure, gas_density) can degrade.
@@ -319,9 +410,11 @@ def train_mean_model(
     y_scale_np = np.where(y_scale_np < 1e-6, 1.0, y_scale_np).astype(np.float32)
     y_scale = torch.from_numpy(y_scale_np).to(device)
 
+    mean_ds = TensorDataset(x, y, sample_w)
+
     mean_sampler = (
         DistributedSampler(
-            TensorDataset(x, y),
+            mean_ds,
             num_replicas=dist_world_size(),
             rank=dist_rank(),
             shuffle=True,
@@ -335,7 +428,7 @@ def train_mean_model(
         workers = int(num_workers_override)
 
     loader = DataLoader(
-        TensorDataset(x, y),
+        mean_ds,
         batch_size=args.mean_batch_size,
         shuffle=(mean_sampler is None),
         sampler=mean_sampler,
@@ -365,11 +458,11 @@ def train_mean_model(
     opt = torch.optim.AdamW(list(model.parameters()), lr=args.mean_lr, weight_decay=args.mean_weight_decay)  # type: ignore[arg-type]
     mean_loss_kind = str(getattr(args, "mean_loss", "mse")).lower()
     if mean_loss_kind == "huber":
-        loss_fn = nn.HuberLoss(delta=0.5)
+        loss_fn = nn.HuberLoss(delta=0.5, reduction="none")
     elif mean_loss_kind == "mae":
-        loss_fn = nn.L1Loss()
+        loss_fn = nn.L1Loss(reduction="none")
     else:
-        loss_fn = nn.MSELoss()
+        loss_fn = nn.MSELoss(reduction="none")
 
     for epoch in range(args.mean_epochs):
         if mean_sampler is not None:
@@ -377,16 +470,22 @@ def train_mean_model(
         model.train()
         epoch_loss_sum = 0.0
         epoch_sample_count = 0
-        for xb, yb in loader:
+        for xb, yb, wb in loader:
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
+            wb = wb.to(device, non_blocking=True)
 
             theta_in = xb[:, 2:2 + mean_theta_dim] if mean_theta_dim > 0 else None
             z_idx = 2 + mean_theta_dim
             z_in = xb[:, z_idx] if multi_snap else None
             pred = model(xb[:, 0], xb[:, 1], theta=theta_in, redshift=z_in)
-            # Channel-balanced MSE in normalized target space.
-            loss = loss_fn((pred - yb) / y_scale.view(1, -1), torch.zeros_like(yb))
+            # Channel-balanced loss in normalized target space, with optional
+            # per-sample snapshot balancing weights.
+            per_sample = loss_fn(
+                (pred - yb) / y_scale.view(1, -1),
+                torch.zeros_like(yb),
+            ).mean(dim=-1)  # (B,)
+            loss = (per_sample * wb).mean()
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -418,6 +517,46 @@ def train_mean_model(
     return core_model
 
 
+def train_per_snapshot_mean_models(
+    tasks: List[RunTask],
+    y_dim: int,
+    args,
+    device: torch.device,
+    verbose: bool = True,
+    num_workers_override: Optional[int] = None,
+) -> PerSnapshotMeanModel:
+    """Train a separate MeanModel per unique redshift and wrap them."""
+    from collections import defaultdict
+
+    snap_tasks: Dict[str, List[RunTask]] = defaultdict(list)
+    for t in tasks:
+        z_key = f"{float(t.redshift):.2f}"
+        snap_tasks[z_key].append(t)
+
+    if verbose:
+        for z_key in sorted(snap_tasks):
+            n_pts = sum(t.n_halo * t.n_r for t in snap_tasks[z_key])
+            print(f"Per-snapshot mean model: z={z_key}  tasks={len(snap_tasks[z_key])}  points={n_pts}")
+
+    models: Dict[str, MeanModel] = {}
+    for z_key in sorted(snap_tasks):
+        if verbose:
+            print(f"\n--- Training mean model for z={z_key} ---")
+        model = train_mean_model(
+            snap_tasks[z_key],
+            y_dim=y_dim,
+            args=args,
+            device=device,
+            verbose=verbose,
+            num_workers_override=num_workers_override,
+        )
+        models[z_key] = model
+
+    wrapper = PerSnapshotMeanModel(models)
+    wrapper.eval()
+    return wrapper
+
+
 def get_mean_model_config(mean_model: MeanModel) -> Dict[str, Any]:
     hidden_dim = 0
     if len(mean_model.net) > 0 and isinstance(mean_model.net[0], nn.Linear):
@@ -438,27 +577,103 @@ def get_mean_model_config(mean_model: MeanModel) -> Dict[str, Any]:
 
 def save_mean_checkpoint(
     checkpoint_path: Path,
-    mean_model: MeanModel,
+    mean_model: Union[MeanModel, PerSnapshotMeanModel],
     args,
     target_names: List[str],
     mean_metrics: Optional[Dict[str, Any]] = None,
 ) -> None:
-    payload = {
-        "mean_model_state_dict": mean_model.state_dict(),
-        "mean_model_config": get_mean_model_config(mean_model),
-        "target_name": args.target_name,
-        "target_names": target_names,
-        "args": vars(args),
-        "mean_metrics": mean_metrics,
-    }
+    if isinstance(mean_model, PerSnapshotMeanModel):
+        payload = {
+            "per_snapshot_mean_models": True,
+            "mean_model_configs": {
+                z_key: get_mean_model_config(mean_model.get_model(z_key))
+                for z_key in mean_model.z_keys
+            },
+            "mean_model_state_dicts": {
+                z_key: mean_model.get_model(z_key).state_dict()
+                for z_key in mean_model.z_keys
+            },
+            "target_name": args.target_name,
+            "target_names": target_names,
+            "args": vars(args),
+            "mean_metrics": mean_metrics,
+        }
+    else:
+        payload = {
+            "mean_model_state_dict": mean_model.state_dict(),
+            "mean_model_config": get_mean_model_config(mean_model),
+            "target_name": args.target_name,
+            "target_names": target_names,
+            "args": vars(args),
+            "mean_metrics": mean_metrics,
+        }
     torch.save(payload, checkpoint_path)
 
 
-def load_mean_checkpoint(checkpoint_path: Path, device: torch.device) -> Tuple[MeanModel, Dict[str, Any]]:
+def _mean_model_checkpoint_entries(
+    mean_model: Optional[Union[MeanModel, PerSnapshotMeanModel]],
+) -> Dict[str, Any]:
+    """Return checkpoint dict entries that describe the mean model."""
+    if mean_model is None:
+        return {
+            "mean_model_state_dict": None,
+            "mean_model_config": None,
+            "per_snapshot_mean_models": False,
+        }
+    if isinstance(mean_model, PerSnapshotMeanModel):
+        return {
+            "per_snapshot_mean_models": True,
+            "mean_model_state_dict": mean_model.state_dict(),
+            "mean_model_config": None,
+            "mean_model_configs": {
+                z_key: get_mean_model_config(mean_model.get_model(z_key))
+                for z_key in mean_model.z_keys
+            },
+            "mean_model_state_dicts": {
+                z_key: mean_model.get_model(z_key).state_dict()
+                for z_key in mean_model.z_keys
+            },
+        }
+    return {
+        "mean_model_state_dict": mean_model.state_dict(),
+        "mean_model_config": get_mean_model_config(mean_model),
+        "per_snapshot_mean_models": False,
+    }
+
+
+def load_mean_checkpoint(
+    checkpoint_path: Path, device: torch.device,
+) -> Tuple[Union[MeanModel, PerSnapshotMeanModel], Dict[str, Any]]:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Mean checkpoint not found: {checkpoint_path}")
 
     raw = torch.load(checkpoint_path, map_location=device)
+
+    # ---- per-snapshot mean models ----
+    if raw.get("per_snapshot_mean_models", False):
+        configs = raw["mean_model_configs"]
+        states = raw["mean_model_state_dicts"]
+        models: Dict[str, MeanModel] = {}
+        for z_key in sorted(configs):
+            cfg = configs[z_key]
+            m = MeanModel(
+                y_dim=int(cfg["y_dim"]),
+                hidden_dim=int(cfg["hidden_dim"]),
+                use_redshift=False,
+                theta_dim=int(cfg["theta_dim"]),
+                theta_start_idx=int(cfg["theta_start_idx"]),
+                n_hidden_layers=int(cfg.get("n_hidden_layers", 2)),
+            ).to(device)
+            m.load_state_dict(states[z_key])
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad_(False)
+            models[z_key] = m
+        wrapper = PerSnapshotMeanModel(models).to(device)
+        wrapper.eval()
+        return wrapper, raw
+
+    # ---- single shared mean model (legacy) ----
     cfg = raw.get("mean_model_config")
     state = raw.get("mean_model_state_dict")
     if cfg is None or state is None:
@@ -1077,6 +1292,13 @@ def build_tasks(args) -> List[RunFamilyTask]:
                     # Load temperature for CC indicator before NPZ context closes.
                     if use_cc_indicator:
                         temperature_for_cc = data["temperature_array"].astype(np.float32)
+
+                # Skip snapshots where the simulation produced no halos
+                # (e.g., low-Omega0 runs at high redshift).  Without this
+                # guard the reshape below raises ValueError and the entire
+                # run (all snapshots) is discarded, biasing parameter priors.
+                if m500c.shape[0] == 0:
+                    continue
 
                 if y.ndim == 2:
                     y = y[..., None]
@@ -1845,13 +2067,23 @@ class StrongANP(nn.Module):
         input_noise_std: float = 0.0,
         beta_nll_weight: float = 0.0,
         free_bits: float = 0.0,
+        snapshot_balanced_loss: bool = False,
+        stratified_var_cal_weight: float = 0.0,
+        stratified_mass_bins: int = 4,
+        stratified_radius_bins: int = 4,
+        stratified_min_points: int = 16,
     ):
         super().__init__()
 
+        self.snapshot_balanced_loss = bool(snapshot_balanced_loss)
         self.context_dropout_rate = float(context_dropout_rate)
         self.input_noise_std = float(input_noise_std)
         self.beta_nll_weight = float(beta_nll_weight)
         self.free_bits = float(free_bits)
+        self.stratified_var_cal_weight = float(stratified_var_cal_weight)
+        self.stratified_mass_bins = max(1, int(stratified_mass_bins))
+        self.stratified_radius_bins = max(1, int(stratified_radius_bins))
+        self.stratified_min_points = max(1, int(stratified_min_points))
 
         self.radius_fourier_n_freq = int(radius_fourier_n_freq)
         self.radial_feature_idx = int(radial_feature_idx)
@@ -2126,6 +2358,29 @@ class StrongANP(nn.Module):
 
         radius_w = self._build_radius_weights(tgt_mask, batch["meta"]).unsqueeze(-1).to(mask_3d.dtype)
         weighted_mask_3d = mask_3d * radius_w
+
+        # Snapshot-balanced loss: reweight each batch element so all redshifts
+        # contribute equally, preventing high-data-volume snapshots from
+        # dominating the loss signal.
+        if self.snapshot_balanced_loss and self.training:
+            # Compute weights in float32 to avoid AMP float16 rounding issues,
+            # then cast to match weighted_mask_3d.
+            z_per_elem = torch.tensor(
+                [float(m["redshift"]) for m in batch["meta"]],
+                device=mu.device, dtype=torch.float32,
+            )
+            z_rounded = torch.round(z_per_elem * 1e4) / 1e4
+            unique_z_batch = z_rounded.unique()
+            n_snaps_batch = len(unique_z_batch)
+            snap_w = torch.ones_like(z_rounded)
+            for uz in unique_z_batch:
+                mask_uz = (z_rounded == uz)
+                count_uz = mask_uz.sum().float().clamp_min(1.0)
+                snap_w[mask_uz] = float(n_snaps_batch) / count_uz
+            # Normalize to mean=1 so total loss magnitude is unchanged.
+            snap_w = snap_w / snap_w.mean().clamp_min(1e-12)
+            weighted_mask_3d = weighted_mask_3d * snap_w.to(weighted_mask_3d.dtype).view(-1, 1, 1)
+
         denom = weighted_mask_3d.sum().clamp_min(1.0)
 
         # Optional dynamic channel balancing to avoid multi-output collapse where
@@ -2177,6 +2432,52 @@ class StrongANP(nn.Module):
         pred_var = self._aleatoric_var_from_scale(sigma)
         var_cal_pt = (torch.log(pred_var + 1e-8) - torch.log(resid_sq.detach() + 1e-8)) ** 2
         var_cal = (var_cal_pt * weighted_mask_3d).sum() / denom
+        stratified_var_cal = torch.zeros((), device=mu.device, dtype=mu.dtype)
+        if self.stratified_var_cal_weight > 0.0:
+            cell_losses: List[torch.Tensor] = []
+            n_total_pts = int(tgt_mask.shape[1])
+            for b in range(tgt_mask.shape[0]):
+                n_halo = int(batch["meta"][b]["n_halo"])
+                n_r = int(batch["meta"][b]["n_r"])
+                n_pts = int(min(n_total_pts, n_halo * n_r))
+                if n_halo <= 0 or n_r <= 0 or n_pts <= 0:
+                    continue
+
+                n_mass_bins = min(self.stratified_mass_bins, n_halo)
+                n_rad_bins = min(self.stratified_radius_bins, n_r)
+                if n_mass_bins <= 0 or n_rad_bins <= 0:
+                    continue
+
+                # Mass is constant across radius for each halo; use first radius value.
+                mass_vals = tgt_x_raw[b, :n_pts, 0].reshape(n_halo, n_r)[:, 0].detach()
+                if not torch.isfinite(mass_vals).all():
+                    continue
+                if n_mass_bins > 1:
+                    q = torch.linspace(0.0, 1.0, n_mass_bins + 1, device=mu.device, dtype=mass_vals.dtype)
+                    mass_edges = torch.quantile(mass_vals, q)
+                    mass_bin_idx = torch.bucketize(mass_vals, mass_edges[1:-1], right=False)
+                else:
+                    mass_bin_idx = torch.zeros(n_halo, device=mu.device, dtype=torch.long)
+
+                r_idx = torch.arange(n_r, device=mu.device, dtype=torch.long)
+                rad_bin_idx = torch.div(r_idx * n_rad_bins, n_r, rounding_mode="floor").clamp(max=n_rad_bins - 1)
+
+                halo_bin_flat = mass_bin_idx.repeat_interleave(n_r)
+                rad_bin_flat = rad_bin_idx.repeat(n_halo)
+                for mb in range(n_mass_bins):
+                    for rb in range(n_rad_bins):
+                        point_sel = (halo_bin_flat == mb) & (rad_bin_flat == rb)
+                        if int(point_sel.sum().item()) < self.stratified_min_points:
+                            continue
+                        cell_mask = torch.zeros(n_total_pts, device=mu.device, dtype=mu.dtype)
+                        cell_mask[:n_pts] = point_sel.to(mu.dtype)
+                        cell_mask_3d = cell_mask.view(1, -1, 1) * weighted_mask_3d[b : b + 1]
+                        cell_denom = cell_mask_3d.sum().clamp_min(1.0)
+                        cell_losses.append((var_cal_pt[b : b + 1] * cell_mask_3d).sum() / cell_denom)
+
+            if cell_losses:
+                stratified_var_cal = torch.stack(cell_losses).mean()
+
         sigma_mean = (sigma * mask_3d).sum() / mask_3d.sum().clamp_min(1.0)
         smooth = self._profile_smoothness_penalty(mu, tgt_mask, batch["meta"])
 
@@ -2225,6 +2526,7 @@ class StrongANP(nn.Module):
 
         loss = -(recon - beta * kl) + task_uncertainty_loss
         loss = loss + self.var_cal_weight * var_cal
+        loss = loss + self.stratified_var_cal_weight * stratified_var_cal
         loss = loss + self.smoothness_weight * smooth
         loss = loss + self.core_bias_weight * core_bias
         loss = loss + self.ideal_gas_weight * ideal_gas
@@ -2236,6 +2538,7 @@ class StrongANP(nn.Module):
             "kl": kl,
             "rmse_norm": rmse_norm,
             "var_cal": var_cal,
+            "stratified_var_cal": stratified_var_cal,
             "sigma_mean": sigma_mean,
             "smooth": smooth,
             "core_bias": core_bias,
@@ -2326,8 +2629,10 @@ def _coverage_halfwidth_multiplier(
         return torch.tensor(float(sigma_level), device=device, dtype=dtype)
 
     q = 0.5 * (1.0 + p_two_sided)
-    q_t = torch.tensor(q, device=device, dtype=dtype)
-    return StudentT(df=float(student_t_df)).icdf(q_t)
+    # StudentT.icdf is not implemented in PyTorch; use scipy instead.
+    from scipy.stats import t as scipy_t
+    val = float(scipy_t.ppf(q, df=float(student_t_df)))
+    return torch.tensor(val, device=device, dtype=dtype)
 
 
 def _all_profile_log_indices(target_names: List[str]) -> List[int]:
@@ -2374,6 +2679,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, epoch, kl_warmup, 
         "kl": [],
         "rmse_norm": [],
         "var_cal": [],
+        "stratified_var_cal": [],
         "sigma_mean": [],
         "smooth": [],
         "core_bias": [],
@@ -2411,6 +2717,7 @@ def validate_one_epoch(model, loader, device, epoch, kl_warmup):
         "kl": [],
         "rmse_norm": [],
         "var_cal": [],
+        "stratified_var_cal": [],
         "sigma_mean": [],
         "smooth": [],
         "core_bias": [],
@@ -2911,12 +3218,12 @@ def make_arg_parser():
         default=1,
         help="Minimum snapshots required for a run-family to be kept.",
     )
-    p.add_argument("--target-name", type=str, default="log_pressure", choices=TARGET_CHOICES)
+    p.add_argument("--target-name", type=str, default="all_profiles", choices=TARGET_CHOICES)
     p.add_argument(
         "--all-profiles-subset",
         type=str,
         nargs="+",
-        default=None,
+        default=["temperature", "pressure", "gas_density", "metallicity"],
         choices=ALL_PROFILE_TARGETS,
         help="Optional subset of all_profiles channels to train jointly. Only used when --target-name=all_profiles.",
     )
@@ -2930,9 +3237,9 @@ def make_arg_parser():
                         "0 (default) keeps the original behaviour (valid if > 0). "
                         "A value like 1e-29 removes extreme resolution-floor artefacts.")
 
-    p.add_argument("--max-runs", type=int, default=0, help="0 means all discovered runs")
-    p.add_argument("--min-halos", type=int, default=4)
-    p.add_argument("--max-halos-per-run", type=int, default=0, help="0 means keep all halos")
+    p.add_argument("--max-runs", type=int, default=1024, help="0 means all discovered runs")
+    p.add_argument("--min-halos", type=int, default=2)
+    p.add_argument("--max-halos-per-run", type=int, default=128, help="0 means keep all halos")
     p.add_argument("--radial-stride", type=int, default=1)
     p.add_argument(
         "--mass-floor",
@@ -2987,25 +3294,25 @@ def make_arg_parser():
     p.add_argument("--train-frac", type=float, default=0.8)
     p.add_argument("--val-frac", type=float, default=0.1)
 
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--num-workers", type=int, default=8)
+    p.add_argument("--epochs", type=int, default=500)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-3)
     p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--kl-warmup-epochs", type=int, default=50)
-    p.add_argument("--patience", type=int, default=30)
+    p.add_argument("--kl-warmup-epochs", type=int, default=120)
+    p.add_argument("--patience", type=int, default=80)
     p.add_argument(
         "--early-stop-min-delta",
         type=float,
-        default=0.0,
+        default=0.0001,
         help="Minimum validation improvement required to reset patience.",
     )
-    p.add_argument("--accum-steps", type=int, default=1)
+    p.add_argument("--accum-steps", type=int, default=16)
     p.add_argument(
         "--select-metric",
         type=str,
-        default="rmse_norm",
+        default="weighted_orig",
         choices=["loss", "rmse", "rmse_norm", "weighted_orig"],
         help="Validation metric used for early stopping/checkpoint selection",
     )
@@ -3024,52 +3331,52 @@ def make_arg_parser():
     p.add_argument(
         "--selection-pressure-weight",
         type=float,
-        default=0.15,
+        default=0.2,
         help="Additional weight on pressure RMSE in weighted_orig selection metric.",
     )
     p.add_argument(
         "--selection-temperature-weight",
         type=float,
-        default=0.15,
+        default=0.2,
         help="Additional weight on temperature RMSE in weighted_orig selection metric.",
     )
     p.add_argument(
         "--selection-pressure-core-weight",
         type=float,
-        default=0.0,
+        default=0.25,
         help="Additional weight on core-only pressure RMSE in weighted_orig selection metric.",
     )
     p.add_argument(
         "--selection-temperature-core-weight",
         type=float,
-        default=0.0,
+        default=0.35,
         help="Additional weight on core-only temperature RMSE in weighted_orig selection metric.",
     )
 
-    p.add_argument("--d-model", type=int, default=256)
-    p.add_argument("--d-latent", type=int, default=128)
+    p.add_argument("--d-model", type=int, default=192)
+    p.add_argument("--d-latent", type=int, default=96)
     p.add_argument("--radius-fourier-n-freq", type=int, default=16)
-    p.add_argument("--radius-fourier-scale", type=float, default=1.0)
+    p.add_argument("--radius-fourier-scale", type=float, default=2.0)
     p.add_argument("--disable-radius-fourier", action="store_true")
     p.add_argument("--n-heads", type=int, default=8)
-    p.add_argument("--n-latent-layers", type=int, default=2)
-    p.add_argument("--n-ctx-layers", type=int, default=2)
-    p.add_argument("--max-latent-points", type=int, default=4096)
-    p.add_argument("--dec-hidden", type=int, default=512)
+    p.add_argument("--n-latent-layers", type=int, default=3)
+    p.add_argument("--n-ctx-layers", type=int, default=3)
+    p.add_argument("--max-latent-points", type=int, default=1024)
+    p.add_argument("--dec-hidden", type=int, default=384)
     p.add_argument("--dec-layers", type=int, default=4)
-    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--dropout", type=float, default=0.25)
     p.add_argument("--theta-film-scale", type=float, default=0.1)
     p.add_argument(
         "--decoder-likelihood",
         type=str,
-        default="gaussian",
+        default="student_t",
         choices=["gaussian", "student_t"],
         help="Likelihood family used for decoder reconstruction/NLL.",
     )
     p.add_argument(
         "--student-t-df",
         type=float,
-        default=5.0,
+        default=4.0,
         help="Degrees of freedom for Student-t decoder likelihood (must be > 2).",
     )
     p.add_argument("--smoothness-weight", type=float, default=0.005)
@@ -3083,11 +3390,38 @@ def make_arg_parser():
             "Only active when gas_density, temperature, and pressure are all present."
         ),
     )
-    p.add_argument("--var-cal-weight", type=float, default=0.0)
+    p.add_argument("--var-cal-weight", type=float, default=0.05)
+    p.add_argument(
+        "--stratified-var-cal-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for mass-radius stratified variance calibration. "
+            "Computes variance-calibration loss per mass/radius cell and averages across cells."
+        ),
+    )
+    p.add_argument(
+        "--stratified-mass-bins",
+        type=int,
+        default=4,
+        help="Number of mass bins per training batch element for stratified variance calibration.",
+    )
+    p.add_argument(
+        "--stratified-radius-bins",
+        type=int,
+        default=4,
+        help="Number of radius bins per halo for stratified variance calibration.",
+    )
+    p.add_argument(
+        "--stratified-min-points",
+        type=int,
+        default=16,
+        help="Minimum points required in a mass-radius cell before contributing to stratified calibration.",
+    )
     p.add_argument(
         "--context-dropout-rate",
         type=float,
-        default=0.0,
+        default=0.3,
         help=(
             "Fraction of context points randomly masked during training. "
             "Forces the model to learn robust priors and prevents over-reliance "
@@ -3097,7 +3431,7 @@ def make_arg_parser():
     p.add_argument(
         "--input-noise-std",
         type=float,
-        default=0.0,
+        default=0.02,
         help=(
             "Standard deviation of Gaussian noise added to input features "
             "during training for regularization. 0 disables. Recommended: 0.01-0.03."
@@ -3106,7 +3440,7 @@ def make_arg_parser():
     p.add_argument(
         "--beta-nll-weight",
         type=float,
-        default=0.0,
+        default=0.5,
         help=(
             "Beta-NLL (Seitzer et al. 2022): weight reconstruction log-prob by "
             "sigma^(2*beta) (detached) to prevent overconfident sigma collapse. "
@@ -3116,7 +3450,7 @@ def make_arg_parser():
     p.add_argument(
         "--free-bits",
         type=float,
-        default=0.0,
+        default=0.5,
         help=(
             "Free bits: minimum KL divergence per latent dimension (nats). "
             "Prevents posterior collapse while maintaining useful latent structure. "
@@ -3126,13 +3460,13 @@ def make_arg_parser():
     p.add_argument(
         "--task-uncertainty-l2-weight",
         type=float,
-        default=0.0,
+        default=0.0005,
         help="L2 regularization strength for all_profiles log_sigma_task parameters.",
     )
     p.add_argument(
         "--task-uncertainty-clip",
         type=float,
-        default=0.0,
+        default=5.0,
         help="If >0, clamp log_sigma_task to [-clip, clip] during forward pass.",
     )
     p.add_argument(
@@ -3143,6 +3477,7 @@ def make_arg_parser():
     p.add_argument(
         "--channel-balance-loss",
         action="store_true",
+        default=True,
         help="Dynamically rebalance multi-output reconstruction/loss terms by inverse per-channel RMSE.",
     )
     p.add_argument(
@@ -3158,9 +3493,28 @@ def make_arg_parser():
         help="Numerical floor for channel balancing RMSE.",
     )
     p.add_argument(
+        "--snapshot-balanced-loss",
+        action="store_true",
+        help=(
+            "Reweight loss so each redshift contributes equally, regardless of "
+            "data volume per snapshot.  Applied to both the mean model and the "
+            "ANP reconstruction terms."
+        ),
+    )
+    p.add_argument(
+        "--per-snapshot-mean",
+        action="store_true",
+        help=(
+            "Train a separate mean model for each redshift instead of one "
+            "shared model.  Each per-snapshot model specialises to its own "
+            "redshift, eliminating cross-z bias (e.g. cool-core bimodality "
+            "at z=0)."
+        ),
+    )
+    p.add_argument(
         "--core-radius-weight",
         type=float,
-        default=1.0,
+        default=2.0,
         help="Multiplicative weight for inner radial bins in reconstruction/MSE terms (1.0 disables).",
     )
     p.add_argument(
@@ -3172,7 +3526,7 @@ def make_arg_parser():
     p.add_argument(
         "--core-radius-min-bins",
         type=int,
-        default=3,
+        default=6,
         help="Minimum number of inner bins per halo treated as core.",
     )
     p.add_argument(
@@ -3274,9 +3628,11 @@ def make_arg_parser():
     p.add_argument("--mean-loss", type=str, default="mse", choices=["mse", "huber", "mae"],
                    help="Loss function for mean model. 'huber' (delta=0.5) or 'mae' reduces influence of core outliers; produces median-like predictions.")
     p.add_argument("--mean-hidden-dim", type=int, default=128)
+    p.add_argument("--mean-n-hidden", type=int, default=-1,
+                   help="Number of hidden layers in mean model. Default: auto (2 base, 3 with theta).")
     p.add_argument("--mean-epochs", type=int, default=80)
     p.add_argument("--mean-lr", type=float, default=1e-3)
-    p.add_argument("--mean-weight-decay", type=float, default=1e-5)
+    p.add_argument("--mean-weight-decay", type=float, default=1e-3)
     p.add_argument("--mean-batch-size", type=int, default=131072)
     p.add_argument("--mean-log-every", type=int, default=10)
     p.add_argument("--mean-predict-batch-size", type=int, default=262144)
@@ -3304,7 +3660,7 @@ def make_arg_parser():
         help="Optional explicit output path for saved mean model checkpoint.",
     )
 
-    p.add_argument("--eval-samples", type=int, default=50)
+    p.add_argument("--eval-samples", type=int, default=30)
     p.add_argument("--fewshot-contexts", type=int, nargs="+", default=[1, 2, 5, 10])
     p.add_argument("--fewshot-repeats", type=int, default=6)
 
@@ -3479,7 +3835,10 @@ def main():
     y_dim = train_raw[0].snapshots[0].y.shape[-1]
     mean_theta_dim = int(args.theta_dim) if getattr(args, "mean_use_theta", False) else 0
     args.mean_theta_dim = mean_theta_dim
-    mean_n_hidden = 3 if mean_theta_dim > 0 else 2
+    if int(getattr(args, "mean_n_hidden", -1)) > 0:
+        mean_n_hidden = int(args.mean_n_hidden)
+    else:
+        mean_n_hidden = 3 if mean_theta_dim > 0 else 2
     args.mean_n_hidden = mean_n_hidden
     mean_model: Optional[MeanModel] = None
     mean_prior_enabled = not args.disable_mean_prior
@@ -3509,16 +3868,28 @@ def main():
             mean_prior_source = "loaded"
             mean_checkpoint_used = str(mean_ckpt)
         else:
+            use_per_snap = bool(getattr(args, "per_snapshot_mean", False))
             if main_proc:
-                print("Pre-training frozen mean profile model for residual targets...")
-            mean_model = train_mean_model(
-                train_raw_flat_original,
-                y_dim=y_dim,
-                args=args,
-                device=device,
-                verbose=main_proc,
-                num_workers_override=None,
-            )
+                label = "per-snapshot" if use_per_snap else "shared"
+                print(f"Pre-training frozen {label} mean profile model for residual targets...")
+            if use_per_snap:
+                mean_model = train_per_snapshot_mean_models(
+                    train_raw_flat_original,
+                    y_dim=y_dim,
+                    args=args,
+                    device=device,
+                    verbose=main_proc,
+                    num_workers_override=None,
+                )
+            else:
+                mean_model = train_mean_model(
+                    train_raw_flat_original,
+                    y_dim=y_dim,
+                    args=args,
+                    device=device,
+                    verbose=main_proc,
+                    num_workers_override=None,
+                )
             mean_prior_source = "trained"
 
         if mean_model is None:
@@ -3840,6 +4211,11 @@ def main():
         input_noise_std=float(getattr(args, "input_noise_std", 0.0)),
         beta_nll_weight=float(getattr(args, "beta_nll_weight", 0.0)),
         free_bits=float(getattr(args, "free_bits", 0.0)),
+        snapshot_balanced_loss=bool(getattr(args, "snapshot_balanced_loss", False)),
+        stratified_var_cal_weight=float(getattr(args, "stratified_var_cal_weight", 0.0)),
+        stratified_mass_bins=int(getattr(args, "stratified_mass_bins", 4)),
+        stratified_radius_bins=int(getattr(args, "stratified_radius_bins", 4)),
+        stratified_min_points=int(getattr(args, "stratified_min_points", 16)),
     ).to(device)
 
     # Populate the y_std buffer so the ideal-gas penalty can convert normalised
@@ -4084,8 +4460,7 @@ def main():
                         "mean_prior_enabled": mean_prior_enabled,
                         "mean_prior_source": mean_prior_source,
                         "mean_checkpoint": mean_checkpoint_used,
-                        "mean_model_state_dict": None if mean_model is None else mean_model.state_dict(),
-                        "mean_model_config": None if mean_model is None else get_mean_model_config(mean_model),
+                        **_mean_model_checkpoint_entries(mean_model),
                         "cc_prior": cc_prior_stats,
                         "cc_predictor_state_dict": None if cc_predictor_model is None else cc_predictor_model.state_dict(),
                     },
@@ -4258,8 +4633,7 @@ def main():
                 "mean_prior_enabled": mean_prior_enabled,
                 "mean_prior_source": mean_prior_source,
                 "mean_checkpoint": mean_checkpoint_used,
-                "mean_model_state_dict": None if mean_model is None else mean_model.state_dict(),
-                "mean_model_config": None if mean_model is None else get_mean_model_config(mean_model),
+                **_mean_model_checkpoint_entries(mean_model),
                 "cc_prior": cc_prior_stats,
                 "cc_predictor_state_dict": None if cc_predictor_model is None else cc_predictor_model.state_dict(),
             },

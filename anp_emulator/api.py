@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
-from train_anp_emulator import CCPredictor, MeanModel, StrongANP, add_mean_back, denorm_y, restore_all_profiles_physical_units, _lookup_bin_stats
+from train_anp_emulator import CCPredictor, MeanModel, PerSnapshotMeanModel, StrongANP, add_mean_back, denorm_y, restore_all_profiles_physical_units, _lookup_bin_stats
 
 FieldArg = Union[str, Sequence[str]]
 RadialBinsArg = Union[np.ndarray, Sequence[float], Sequence[Sequence[float]]]
@@ -31,7 +31,7 @@ class Emulator:
     def __init__(
         self,
         model: StrongANP,
-        mean_model: MeanModel | None,
+        mean_model: MeanModel | PerSnapshotMeanModel | None,
         checkpoint_path: Path,
         target_names: List[str],
         args: Dict[str, Any],
@@ -233,27 +233,49 @@ class Emulator:
 
         mean_model = None
         if bool(state.get("mean_prior_enabled", False)) and state.get("mean_model_state_dict", None) is not None:
-            mm_sd = state["mean_model_state_dict"]
-            first_weight_key = next((k for k in mm_sd if k.endswith("net.0.weight")), None)
-            # Detect input dimension to infer redshift and theta usage.
-            mm_in_dim = int(mm_sd[first_weight_key].shape[1]) if first_weight_key else 2
-            mean_theta_dim = int(args.get("mean_theta_dim", 0))
-            theta_start_idx = int(args.get("theta_start_idx", 2))
-            # input = 2 (logM, logr) + theta_dim + (1 if redshift)
-            mean_use_redshift = (mm_in_dim == 2 + mean_theta_dim + 1)
-            # Infer n_hidden_layers from the number of weight matrices in the state dict.
-            mm_weight_keys = sorted(k for k in mm_sd if k.startswith("net.") and k.endswith(".weight"))
-            mm_n_hidden = max(1, len(mm_weight_keys) - 1)  # all but the output layer
-            mean_model = MeanModel(
-                y_dim=int(y_mean_np.shape[0]),
-                hidden_dim=int(args.get("mean_hidden_dim", 128)),
-                use_redshift=mean_use_redshift,
-                theta_dim=mean_theta_dim,
-                theta_start_idx=theta_start_idx,
-                n_hidden_layers=mm_n_hidden,
-            )
-            mean_model.load_state_dict(mm_sd)
-            mean_model.eval()
+            # ---- Per-snapshot mean models ----
+            if state.get("per_snapshot_mean_models", False):
+                mm_configs = state["mean_model_configs"]
+                mm_states = state["mean_model_state_dicts"]
+                sub_models: Dict[str, MeanModel] = {}
+                for z_key in sorted(mm_configs):
+                    cfg = mm_configs[z_key]
+                    m = MeanModel(
+                        y_dim=int(y_mean_np.shape[0]),
+                        hidden_dim=int(cfg["hidden_dim"]),
+                        use_redshift=False,
+                        theta_dim=int(cfg["theta_dim"]),
+                        theta_start_idx=int(cfg["theta_start_idx"]),
+                        n_hidden_layers=int(cfg.get("n_hidden_layers", 2)),
+                    )
+                    m.load_state_dict(mm_states[z_key])
+                    m.eval()
+                    sub_models[z_key] = m
+                mean_model = PerSnapshotMeanModel(sub_models)
+                mean_model.eval()
+            else:
+                # ---- Single shared mean model (legacy) ----
+                mm_sd = state["mean_model_state_dict"]
+                first_weight_key = next((k for k in mm_sd if k.endswith("net.0.weight")), None)
+                # Detect input dimension to infer redshift and theta usage.
+                mm_in_dim = int(mm_sd[first_weight_key].shape[1]) if first_weight_key else 2
+                mean_theta_dim = int(args.get("mean_theta_dim", 0))
+                theta_start_idx = int(args.get("theta_start_idx", 2))
+                # input = 2 (logM, logr) + theta_dim + (1 if redshift)
+                mean_use_redshift = (mm_in_dim == 2 + mean_theta_dim + 1)
+                # Infer n_hidden_layers from the number of weight matrices in the state dict.
+                mm_weight_keys = sorted(k for k in mm_sd if k.startswith("net.") and k.endswith(".weight"))
+                mm_n_hidden = max(1, len(mm_weight_keys) - 1)  # all but the output layer
+                mean_model = MeanModel(
+                    y_dim=int(y_mean_np.shape[0]),
+                    hidden_dim=int(args.get("mean_hidden_dim", 128)),
+                    use_redshift=mean_use_redshift,
+                    theta_dim=mean_theta_dim,
+                    theta_start_idx=theta_start_idx,
+                    n_hidden_layers=mm_n_hidden,
+                )
+                mean_model.load_state_dict(mm_sd)
+                mean_model.eval()
 
         dev = torch.device(device)
         model = model.to(dev)
@@ -304,6 +326,11 @@ class Emulator:
         if requested_ckpt.exists():
             return cls.from_checkpoint(requested_ckpt, device=device)
 
+        # Fallback: scan epoch checkpoints and pick the one with the best
+        # (lowest) val_weighted_orig metric.  If metrics are unavailable,
+        # fall back to the latest epoch number.
+        best_metric_ckpt: Optional[Path] = None
+        best_metric_val: float = float("inf")
         latest_epoch_ckpt: Optional[Path] = None
         latest_epoch_num = -1
         for ckpt_path in run_dir_path.glob("epoch_*.pt"):
@@ -315,9 +342,18 @@ class Emulator:
             if epoch_num > latest_epoch_num:
                 latest_epoch_num = epoch_num
                 latest_epoch_ckpt = ckpt_path
+            try:
+                state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                w = state.get("metrics", {}).get("val_weighted_orig", float("inf"))
+                if w < best_metric_val:
+                    best_metric_val = w
+                    best_metric_ckpt = ckpt_path
+            except Exception:
+                pass
 
-        if latest_epoch_ckpt is not None:
-            return cls.from_checkpoint(latest_epoch_ckpt, device=device)
+        chosen = best_metric_ckpt if best_metric_ckpt is not None else latest_epoch_ckpt
+        if chosen is not None:
+            return cls.from_checkpoint(chosen, device=device)
 
         raise FileNotFoundError(
             f"No checkpoint found in run directory {run_dir_path}. "
