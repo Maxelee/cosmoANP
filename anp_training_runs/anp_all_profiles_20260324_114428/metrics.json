@@ -1,0 +1,156 @@
+{
+  "target_name": "all_profiles",
+  "training_stage": "full",
+  "n_tasks_total": 1021,
+  "n_train": 816,
+  "n_val": 102,
+  "n_test": 103,
+  "n_train_snapshots": 3193,
+  "n_val_snapshots": 402,
+  "n_test_snapshots": 403,
+  "temporal_holdout": {
+    "enabled": false,
+    "snapnum": null,
+    "require_context": false,
+    "n_holdout_target_snapshots": 0,
+    "metrics": null,
+    "metrics_zeroshot": null
+  },
+  "select_metric": "weighted_orig",
+  "best_epoch": 299,
+  "best_score": 0.4122573978971659,
+  "best_val_loss": -0.5498076905138218,
+  "best_val_rmse_norm": 0.3013665323647169,
+  "test": {
+    "rmse_original_units": 0.18944534831322157,
+    "nll_original_units": NaN,
+    "rmse_core_original_units": 0.3514667606526626,
+    "rmse_outer_original_units": 0.15457928573563132,
+    "per_target": {
+      "gas_density": {
+        "rmse_original_units": 0.0,
+        "nll_original_units": NaN,
+        "rmse_core_original_units": 0.0,
+        "rmse_outer_original_units": 0.0
+      },
+      "temperature": {
+        "rmse_original_units": 0.2093360275030136,
+        "nll_original_units": 0.11945608258247375,
+        "rmse_core_original_units": 0.35146674513816833,
+        "rmse_outer_original_units": 0.1545792818069458
+      },
+      "pressure": {
+        "rmse_original_units": 7.486784133018432e-23,
+        "nll_original_units": NaN,
+        "rmse_core_original_units": 1.4973568266036865e-22,
+        "rmse_outer_original_units": 0.0
+      }
+    },
+    "per_snapshot": {
+      "44": {
+        "rmse_original_units": 0.15128891208738227,
+        "n_points": 21780
+      },
+      "60": {
+        "rmse_original_units": 0.2160487542576583,
+        "n_points": 91950
+      },
+      "74": {
+        "rmse_original_units": 0.2007625796449783,
+        "n_points": 75540
+      },
+      "90": {
+        "rmse_original_units": 0.22479218620373112,
+        "n_points": 68400
+      }
+    }
+  },
+  "test_zeroshot": {
+    "rmse_original_units": 0.22097624695071807,
+    "nll_original_units": NaN,
+    "rmse_core_original_units": 0.4046099921187927,
+    "rmse_outer_original_units": 0.16683335457024923,
+    "per_target": {
+      "gas_density": {
+        "rmse_original_units": 0.0,
+        "nll_original_units": NaN,
+        "rmse_core_original_units": 0.0,
+        "rmse_outer_original_units": 0.0
+      },
+      "temperature": {
+        "rmse_original_units": 0.2345390021800995,
+        "nll_original_units": 0.5666952729225159,
+        "rmse_core_original_units": 0.4046100080013275,
+        "rmse_outer_original_units": 0.16683335602283478
+      },
+      "pressure": {
+        "rmse_original_units": 1.2415427403392098e-22,
+        "nll_original_units": NaN,
+        "rmse_core_original_units": 2.6993984615192214e-22,
+        "rmse_outer_original_units": 3.743392066509216e-23
+      }
+    },
+    "per_snapshot": {
+      "44": {
+        "rmse_original_units": 0.17036050083178664,
+        "n_points": 33330
+      },
+      "60": {
+        "rmse_original_units": 0.2304841411366446,
+        "n_points": 65280
+      },
+      "74": {
+        "rmse_original_units": 0.22206488160891671,
+        "n_points": 58410
+      },
+      "90": {
+        "rmse_original_units": 0.2604179990275994,
+        "n_points": 103200
+      }
+    }
+  },
+  "coverage": {
+    "1sigma": 0.7243869086780964,
+    "2sigma": 0.9040777043284451
+  },
+  "fewshot_rmse": {
+    "1": 0.1976460952144594,
+    "2": 0.1965944838280288,
+    "5": 0.196296558321382,
+    "10": 0.19560116425586435
+  },
+  "fewshot_rel_improvement_pct": {
+    "1": 0.0,
+    "2": 0.5320678788465415,
+    "5": 0.6828047331838574,
+    "10": 1.0346427316847058
+  },
+  "mean_prior": {
+    "enabled": false,
+    "source": "disabled",
+    "checkpoint": null,
+    "hidden_dim": 128,
+    "epochs": 80,
+    "lr": 0.001,
+    "weight_decay": 0.001,
+    "metrics": null
+  },
+  "normalization": {
+    "y_mean": [
+      -27.701770782470703,
+      -0.7853337526321411,
+      -24.35667610168457
+    ],
+    "y_std": [
+      1.3390663862228394,
+      0.5473526120185852,
+      1.6907029151916504
+    ]
+  },
+  "target_names": [
+    "gas_density",
+    "temperature",
+    "pressure"
+  ],
+  "checkpoint": "/mnt/home/mlee1/ANP_tests/anp_training_runs/anp_all_profiles_20260324_114428/best_model.pt"
+}
