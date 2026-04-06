@@ -16,7 +16,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 import torch
@@ -24,7 +24,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, StudentT, kl_divergence
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 
 
@@ -976,15 +976,31 @@ def compute_cc_indicator(
     return np.log10(ratio).astype(np.float32)
 
 
+def cc_continuous_to_binary_tag(
+    cc_continuous: np.ndarray,
+    threshold: float = 0.0,
+) -> np.ndarray:
+    """Convert continuous CC indicator to binary CC tags.
+
+    Returns
+    -------
+    cc_tag : (n_halo,) float32 where 1.0=CC and 0.0=NCC.
+    """
+    cc = np.asarray(cc_continuous, dtype=np.float32)
+    return (cc < float(threshold)).astype(np.float32)
+
+
 def fit_cc_prior(
     families: List["RunFamilyTask"],
     cc_feature_idx: int,
+    cc_mode: str = "continuous",
     n_mass_bins: int = 10,
 ) -> Dict[str, Any]:
     """Fit an empirical CC-indicator prior p(cc | log_M) from training data.
 
     Returns a dict suitable for storing in a checkpoint and sampling at inference.
-    The prior is a per-mass-bin Gaussian: for each bin we store (mean_cc, std_cc).
+    - continuous mode: per-mass-bin Gaussian (mean_cc, std_cc)
+    - binary mode: per-mass-bin Bernoulli probability p(CC)
     """
     all_logM = []
     all_cc = []
@@ -1000,14 +1016,31 @@ def fit_cc_prior(
     all_logM = np.concatenate(all_logM)
     all_cc = np.concatenate(all_cc)
 
-    # Global fallback.
-    global_mean = float(np.mean(all_cc))
-    global_std = float(np.std(all_cc))
-
     # Bin edges by percentile to get roughly equal counts.
     bin_edges = np.percentile(all_logM, np.linspace(0, 100, n_mass_bins + 1))
     bin_edges[0] -= 1e-3
     bin_edges[-1] += 1e-3
+
+    mode = str(cc_mode).lower()
+    if mode == "binary":
+        all_cc_tag = (all_cc > 0.5).astype(np.float64)
+        global_p_cc = float(np.mean(all_cc_tag))
+        bin_p_cc = np.full(n_mass_bins, global_p_cc, dtype=np.float64)
+        for i in range(n_mass_bins):
+            mask = (all_logM >= bin_edges[i]) & (all_logM < bin_edges[i + 1])
+            if mask.sum() > 2:
+                bin_p_cc[i] = float(np.mean(all_cc_tag[mask]))
+        return {
+            "mode": "binary",
+            "bin_edges": bin_edges.tolist(),
+            "bin_p_cc": bin_p_cc.tolist(),
+            "global_p_cc": global_p_cc,
+            "n_halos": int(len(all_cc)),
+        }
+
+    # Continuous mode: mass-binned Gaussian prior.
+    global_mean = float(np.mean(all_cc))
+    global_std = float(np.std(all_cc))
 
     bin_mean = np.full(n_mass_bins, global_mean)
     bin_std = np.full(n_mass_bins, global_std)
@@ -1018,6 +1051,7 @@ def fit_cc_prior(
             bin_std[i] = float(max(np.std(all_cc[mask]), 0.01))
 
     return {
+        "mode": "continuous",
         "bin_edges": bin_edges.tolist(),
         "bin_mean": bin_mean.tolist(),
         "bin_std": bin_std.tolist(),
@@ -1030,33 +1064,59 @@ def fit_cc_prior(
 class CCPredictor(nn.Module):
     """Small MLP that predicts CC indicator distribution from (logM, theta).
 
-    Outputs (mu_cc, log_sigma_cc) — a Gaussian p(cc | logM, theta).
-    Trained on training-set halos before ANP training begins, analogous
-    to the mean model.
+    Continuous mode outputs (mu_cc, log_sigma_cc) for Gaussian p(cc | logM, theta).
+    Binary mode outputs Bernoulli logits for p(CC_tag=1 | logM, theta).
     """
 
-    def __init__(self, theta_dim: int = 35, hidden_dim: int = 128, n_layers: int = 3):
+    def __init__(
+        self,
+        theta_dim: int = 35,
+        hidden_dim: int = 128,
+        n_layers: int = 3,
+        mode: str = "continuous",
+    ):
         super().__init__()
+        self.mode = str(mode).lower()
+        if self.mode not in {"continuous", "binary"}:
+            raise ValueError(f"Unsupported CCPredictor mode={mode}")
         in_dim = 1 + theta_dim  # logM + theta
         layers: list[nn.Module] = []
         prev = in_dim
         for _ in range(n_layers):
             layers += [nn.Linear(prev, hidden_dim), nn.GELU()]
             prev = hidden_dim
-        layers.append(nn.Linear(prev, 2))  # (mu_cc, log_sigma_cc)
+        out_dim = 1 if self.mode == "binary" else 2
+        layers.append(nn.Linear(prev, out_dim))
         self.net = nn.Sequential(*layers)
         self.theta_dim = theta_dim
 
-    def forward(self, log_mass: torch.Tensor, theta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return (mu_cc, sigma_cc) per halo.
+    def _forward_raw(self, log_mass: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([log_mass.unsqueeze(-1), theta], dim=-1)
+        return self.net(x)
+
+    def forward_logits(self, log_mass: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        """Return CC logits in binary mode."""
+        if self.mode != "binary":
+            raise RuntimeError("forward_logits is only valid for binary CCPredictor mode")
+        return self._forward_raw(log_mass, theta)[:, 0]
+
+    def forward(self, log_mass: torch.Tensor, theta: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Return CC distribution parameters per halo.
 
         Parameters
         ----------
         log_mass : (N,) log10(M500c)
         theta : (N, theta_dim) feedback / cosmological parameters
+
+        Returns
+        -------
+        continuous mode: (mu_cc, sigma_cc)
+        binary mode: (p_cc, None)
         """
-        x = torch.cat([log_mass.unsqueeze(-1), theta], dim=-1)
-        out = self.net(x)
+        out = self._forward_raw(log_mass, theta)
+        if self.mode == "binary":
+            p_cc = torch.sigmoid(out[:, 0]).clamp(min=1e-3, max=1.0 - 1e-3)
+            return p_cc, None
         mu = out[:, 0]
         sigma = out[:, 1].exp().clamp(min=0.01, max=2.0)
         return mu, sigma
@@ -1065,6 +1125,7 @@ class CCPredictor(nn.Module):
 def train_cc_predictor(
     families: List["RunFamilyTask"],
     cc_feature_idx: int,
+    mode: str = "continuous",
     theta_start_idx: int = 2,
     theta_dim: int = 35,
     hidden_dim: int = 128,
@@ -1078,7 +1139,9 @@ def train_cc_predictor(
     """Pre-train a CCPredictor on training data CC indicators.
 
     Collects (logM, theta, cc) from all training halos and fits
-    p(cc | logM, theta) as a heteroscedastic Gaussian.
+    p(cc | logM, theta) as either:
+    - heteroscedastic Gaussian (continuous mode), or
+    - Bernoulli probability (binary mode).
     """
     all_logM = []
     all_theta = []
@@ -1102,7 +1165,8 @@ def train_cc_predictor(
         print(f"Training CCPredictor on {n_total} halos, theta_dim={theta_dim}, "
               f"hidden={hidden_dim}, layers={n_layers}")
 
-    model = CCPredictor(theta_dim=theta_dim, hidden_dim=hidden_dim, n_layers=n_layers).to(device)
+    cc_mode = str(mode).lower()
+    model = CCPredictor(theta_dim=theta_dim, hidden_dim=hidden_dim, n_layers=n_layers, mode=cc_mode).to(device)
     params = cast(List[torch.Tensor], list(model.parameters()))
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
@@ -1121,10 +1185,15 @@ def train_cc_predictor(
             theta_b = theta_b.to(device)
             cc_b = cc_b.to(device)
 
-            mu, sigma = model(logM_b, theta_b)
-            # Negative log-likelihood of Gaussian.
-            nll = 0.5 * (((cc_b - mu) / sigma) ** 2 + 2.0 * sigma.log() + math.log(2.0 * math.pi))
-            loss = nll.mean()
+            if cc_mode == "binary":
+                logits = model.forward_logits(logM_b, theta_b)
+                loss = F.binary_cross_entropy_with_logits(logits, cc_b)
+            else:
+                mu, sigma = model(logM_b, theta_b)
+                assert sigma is not None
+                # Negative log-likelihood of Gaussian.
+                nll = 0.5 * (((cc_b - mu) / sigma) ** 2 + 2.0 * sigma.log() + math.log(2.0 * math.pi))
+                loss = nll.mean()
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -1137,8 +1206,9 @@ def train_cc_predictor(
         scheduler.step()
 
         if verbose and ((epoch + 1) % 50 == 0 or epoch == 0 or (epoch + 1) == epochs):
-            avg_nll = epoch_nll / max(1, n_samples)
-            print(f"  CCPredictor epoch {epoch+1:03d}/{epochs:03d}: NLL={avg_nll:.4f}")
+            avg_obj = epoch_nll / max(1, n_samples)
+            metric_name = "BCE" if cc_mode == "binary" else "NLL"
+            print(f"  CCPredictor epoch {epoch+1:03d}/{epochs:03d}: {metric_name}={avg_obj:.4f}")
 
     model.eval()
     for p in model.parameters():
@@ -1244,6 +1314,8 @@ def build_tasks(args) -> List[RunFamilyTask]:
     snapnum_to_idx = {int(s): i for i, s in enumerate(snapnums)}
     redshift_by_snap = dict(args.redshift_by_snap)
     use_cc_indicator = bool(getattr(args, "cc_indicator", False))
+    cc_indicator_mode = str(getattr(args, "cc_indicator_mode", "continuous")).lower()
+    cc_binary_threshold = float(getattr(args, "cc_binary_threshold", 0.0))
 
     discovered_by_snap = {
         int(s): discover_runs(base_path, suite=args.suite, sim_set=args.sim_set, snapnum=int(s))
@@ -1380,11 +1452,15 @@ def build_tasks(args) -> List[RunFamilyTask]:
                     x[..., z_idx] = float(redshift_by_snap[int(snap)])
                 if use_cc_indicator:
                     cc_idx = int(args.cc_indicator_feature_idx)
-                    cc_vals = compute_cc_indicator(
+                    cc_cont = compute_cc_indicator(
                         m500c, r500c, temperature_for_cc,
                         core_bins=int(args.cc_indicator_core_bins),
                         eps=args.eps,
                     )
+                    if cc_indicator_mode == "binary":
+                        cc_vals = cc_continuous_to_binary_tag(cc_cont, threshold=cc_binary_threshold)
+                    else:
+                        cc_vals = cc_cont
                     x[..., cc_idx] = cc_vals[:, None]  # broadcast to all r
 
                 snapshots.append(
@@ -1434,6 +1510,251 @@ def split_tasks(tasks: List[RunFamilyTask], train_frac: float, val_frac: float, 
     va = [tasks[i] for i in idx[n_train : n_train + n_val]]
     te = [tasks[i] for i in idx[n_train + n_val :]]
     return tr, va, te
+
+
+def _family_mass_proxy_logm(fam: RunFamilyTask, use_max: bool = False) -> float:
+    """Representative family mass proxy in log10(M500c).
+
+    For mass-stratified splits and quantile routing, ``use_max=True`` should be
+    preferred: it returns the maximum halo mass in the family, which separates
+    boxes by the mass of their *most massive halo*.  This is the right proxy for
+    our use case because each CAMELS box contains ~128 halos spanning a wide
+    range, so the median is compressed into a narrow band and gives no
+    separation power.  With ``use_max=False`` (legacy default) the median is
+    used; kept for backward compatibility with the mass-bin counting helpers
+    used during training split reporting.
+    """
+    vals: List[np.ndarray] = []
+    for s in fam.snapshots:
+        if s.x.size == 0:
+            continue
+        vals.append(np.asarray(s.x[:, 0, 0], dtype=np.float64))
+    if not vals:
+        return float("nan")
+    all_vals = np.concatenate(vals, axis=0)
+    return float(np.max(all_vals) if use_max else np.median(all_vals))
+
+
+def _resolve_mass_bin_edges(bin_edges: Sequence[float], values: np.ndarray) -> np.ndarray:
+    edges = np.unique(np.asarray(bin_edges, dtype=np.float64))
+    if edges.ndim != 1 or edges.shape[0] < 2:
+        raise ValueError("mass_stratification_bins must contain at least two unique values")
+    finite_vals = values[np.isfinite(values)]
+    if finite_vals.size == 0:
+        return edges
+    vmin = float(np.min(finite_vals))
+    vmax = float(np.max(finite_vals))
+    if edges[0] > vmin:
+        edges = np.concatenate(([vmin - 1e-6], edges))
+    if edges[-1] < vmax:
+        edges = np.concatenate((edges, [vmax + 1e-6]))
+    return edges
+
+
+def _mass_bin_counts(families: List[RunFamilyTask], mass_edges: np.ndarray) -> Dict[str, int]:
+    if len(families) == 0:
+        return {}
+    vals = np.asarray([_family_mass_proxy_logm(f) for f in families], dtype=np.float64)
+    idx = np.digitize(vals, mass_edges) - 1
+    idx = np.clip(idx, 0, len(mass_edges) - 2)
+    out: Dict[str, int] = {}
+    for bi in range(len(mass_edges) - 1):
+        lo = float(mass_edges[bi])
+        hi = float(mass_edges[bi + 1])
+        out[f"[{lo:.2f},{hi:.2f})"] = int(np.sum(idx == bi))
+    return out
+
+
+def split_tasks_mass_stratified(
+    tasks: List[RunFamilyTask],
+    train_frac: float,
+    val_frac: float,
+    seed: int,
+    mass_bin_edges: Sequence[float],
+) -> Tuple[List[RunFamilyTask], List[RunFamilyTask], List[RunFamilyTask]]:
+    """Mass-stratified split over run families using per-family median logM proxy."""
+    if len(tasks) == 0:
+        return [], [], []
+
+    rng = np.random.default_rng(seed)
+    fam_logm = np.asarray([_family_mass_proxy_logm(f, use_max=True) for f in tasks], dtype=np.float64)
+    edges = _resolve_mass_bin_edges(mass_bin_edges, fam_logm)
+    bin_idx = np.digitize(fam_logm, edges) - 1
+    bin_idx = np.clip(bin_idx, 0, len(edges) - 2)
+
+    tr_idx: List[int] = []
+    va_idx: List[int] = []
+    te_idx: List[int] = []
+
+    for bi in range(len(edges) - 1):
+        group = np.where(bin_idx == bi)[0]
+        if group.size == 0:
+            continue
+        group = rng.permutation(group)
+        n = int(group.size)
+
+        if n == 1:
+            n_train, n_val = 1, 0
+        elif n == 2:
+            n_train, n_val = 1, 0
+        else:
+            n_train = int(np.floor(n * float(train_frac)))
+            n_val = int(np.floor(n * float(val_frac)))
+
+            n_train = max(1, min(n_train, n - 2))
+            n_val = max(1, min(n_val, n - n_train - 1))
+
+            if (n - n_train - n_val) < 1:
+                if n_train > 1:
+                    n_train -= 1
+                elif n_val > 1:
+                    n_val -= 1
+
+        tr_idx.extend(group[:n_train].tolist())
+        va_idx.extend(group[n_train : n_train + n_val].tolist())
+        te_idx.extend(group[n_train + n_val :].tolist())
+
+    rng.shuffle(tr_idx)
+    rng.shuffle(va_idx)
+    rng.shuffle(te_idx)
+    tr = [tasks[i] for i in tr_idx]
+    va = [tasks[i] for i in va_idx]
+    te = [tasks[i] for i in te_idx]
+    return tr, va, te
+
+
+def compute_mass_sampling_weights(
+    families: List[RunFamilyTask],
+    mass_bin_edges: Sequence[float],
+    high_mass_threshold: float,
+    high_mass_boost: float,
+    balance_power: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-family sampling weights based on inverse mass-bin frequency.
+
+    Returns
+    - weights: shape (n_families,)
+    - fam_logm: shape (n_families,)
+    - edges: mass-bin edges used for counting
+    """
+    if len(families) == 0:
+        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=np.float64), np.asarray(mass_bin_edges, dtype=np.float64)
+
+    fam_logm = np.asarray([_family_mass_proxy_logm(f, use_max=True) for f in families], dtype=np.float64)
+    edges = _resolve_mass_bin_edges(mass_bin_edges, fam_logm)
+    idx = np.digitize(fam_logm, edges) - 1
+    idx = np.clip(idx, 0, len(edges) - 2)
+    counts = np.bincount(idx, minlength=len(edges) - 1).astype(np.float64)
+    base = (1.0 / np.clip(counts[idx], 1.0, None)) ** float(max(balance_power, 0.0))
+    boost = np.where(fam_logm >= float(high_mass_threshold), float(max(high_mass_boost, 1.0)), 1.0)
+    w = base * boost
+    w = w / np.clip(np.mean(w), 1e-12, None)
+    return w.astype(np.float64), fam_logm, edges.astype(np.float64)
+
+
+def filter_tasks_by_mass_quantile(
+    tasks: List[RunFamilyTask],
+    n_quantiles: int,
+    quantile_idx: int,
+) -> Tuple[List[RunFamilyTask], float, float]:
+    """Return only tasks whose mass proxy falls in the given equal-count quantile.
+
+    Boundaries are computed from the full (unfiltered) task list so that each
+    emulator trains on an exclusive, non-overlapping mass slice.
+
+    Returns
+    -------
+    filtered_tasks : list
+    q_lo, q_hi     : log10(M500c) boundaries of this quantile (inclusive on both ends
+                     for the last quantile; inclusive lo / exclusive hi otherwise)
+    """
+    if len(tasks) == 0:
+        return [], float("-inf"), float("inf")
+    if not (0 <= quantile_idx < n_quantiles):
+        raise ValueError(f"quantile_idx={quantile_idx} out of range for n_quantiles={n_quantiles}")
+
+    fam_logm = np.asarray([_family_mass_proxy_logm(f, use_max=True) for f in tasks], dtype=np.float64)
+    valid = fam_logm[np.isfinite(fam_logm)]
+    if len(valid) == 0:
+        return [], float("-inf"), float("inf")
+
+    # Equal-count (percentile) boundaries across the full training pool using max-mass proxy
+    boundaries = np.quantile(valid, np.linspace(0.0, 1.0, n_quantiles + 1))
+    q_lo = float(boundaries[quantile_idx])
+    q_hi = float(boundaries[quantile_idx + 1])
+
+    if quantile_idx == n_quantiles - 1:
+        keep = (fam_logm >= q_lo) & np.isfinite(fam_logm)   # inclusive upper end
+    else:
+        keep = (fam_logm >= q_lo) & (fam_logm < q_hi) & np.isfinite(fam_logm)
+
+    filtered = [t for t, k in zip(tasks, keep) if k]
+    return filtered, q_lo, q_hi
+
+
+def compute_halo_mass_quantile_edges(
+    tasks: List[RunFamilyTask],
+    n_quantiles: int,
+) -> np.ndarray:
+    """Compute equal-count quantile edges from all individual halo masses across all tasks.
+
+    Returns array of shape (n_quantiles + 1,) in log10(M500c).
+    """
+    all_logm: List[np.ndarray] = []
+    for fam in tasks:
+        for s in fam.snapshots:
+            if s.x.size == 0:
+                continue
+            logm = np.asarray(s.x[:, 0, 0], dtype=np.float64)
+            all_logm.append(logm[np.isfinite(logm)])
+    if not all_logm:
+        raise RuntimeError("No valid halo masses found to compute quantile edges.")
+    all_logm_arr = np.concatenate(all_logm)
+    return np.quantile(all_logm_arr, np.linspace(0.0, 1.0, n_quantiles + 1))
+
+
+def filter_halos_by_mass(
+    tasks: List[RunFamilyTask],
+    logm_lo: float,
+    logm_hi: float,
+    inclusive_hi: bool = False,
+    min_halos: int = 2,
+) -> List[RunFamilyTask]:
+    """Filter halos in each RunTask to keep only those with log10(M) in [logm_lo, logm_hi).
+
+    The top quantile uses ``inclusive_hi=True`` so the maximum-mass halo is included.
+    Tasks (snapshots) with fewer than ``min_halos`` surviving halos are dropped.
+    Families with no surviving snapshots are dropped entirely.
+    """
+    out_families: List[RunFamilyTask] = []
+    for fam in tasks:
+        out_snaps: List[RunTask] = []
+        for s in fam.snapshots:
+            if s.x.size == 0:
+                continue
+            logm = np.asarray(s.x[:, 0, 0], dtype=np.float64)
+            if inclusive_hi:
+                keep = np.isfinite(logm) & (logm >= logm_lo) & (logm <= logm_hi)
+            else:
+                keep = np.isfinite(logm) & (logm >= logm_lo) & (logm < logm_hi)
+            n_keep = int(keep.sum())
+            if n_keep < min_halos:
+                continue
+            new_valid = s.valid_mask[keep] if s.valid_mask is not None else None
+            out_snaps.append(RunTask(
+                run_id=s.run_id,
+                snapnum=s.snapnum,
+                snap_idx=s.snap_idx,
+                redshift=s.redshift,
+                x=s.x[keep],
+                y=s.y[keep],
+                n_halo=n_keep,
+                n_r=s.n_r,
+                valid_mask=new_valid,
+            ))
+        if out_snaps:
+            out_families.append(RunFamilyTask(run_id=fam.run_id, snapshots=out_snaps))
+    return out_families
 
 
 def filter_snapshots_in_families(
@@ -2061,6 +2382,7 @@ class StrongANP(nn.Module):
         ideal_gas_channel_indices: Optional[Tuple[int, int, int]] = None,
         cc_dual_head: bool = False,
         cc_indicator_feature_idx: int = -1,
+        cc_indicator_mode: str = "continuous",
         decoder_likelihood: str = "gaussian",
         student_t_df: float = 5.0,
         context_dropout_rate: float = 0.0,
@@ -2131,6 +2453,9 @@ class StrongANP(nn.Module):
         )
         self.cc_dual_head = bool(cc_dual_head)
         self.cc_indicator_feature_idx = int(cc_indicator_feature_idx)
+        self.cc_indicator_mode = str(cc_indicator_mode).lower()
+        if self.cc_indicator_mode not in {"continuous", "binary"}:
+            raise ValueError(f"Unsupported cc_indicator_mode={cc_indicator_mode}")
         self.decoder_likelihood = str(decoder_likelihood).lower()
         if self.decoder_likelihood not in {"gaussian", "student_t"}:
             raise ValueError(f"Unsupported decoder_likelihood={decoder_likelihood}")
@@ -2334,11 +2659,15 @@ class StrongANP(nn.Module):
         if self.cc_dual_head:
             (mu_ncc, sigma_ncc), (mu_cc, sigma_cc) = self.dec.forward_dual(tgt_x, r, z)
             # Build per-point CC mask from raw (pre-Fourier) target features.
-            # CC indicator < 0 → cool-core halo.
+            # Continuous mode: CC indicator < 0 => cool-core.
+            # Binary mode: CC tag >= 0.5 => cool-core.
             cc_feat_idx = self.cc_indicator_feature_idx
             # tgt_x_raw is pre-embedding: (B, max_pts, raw_x_dim)
             cc_val = tgt_x_raw[:, :, cc_feat_idx]          # (B, max_pts)
-            is_cc = (cc_val < 0.0).unsqueeze(-1).float()   # (B, max_pts, 1)
+            if self.cc_indicator_mode == "binary":
+                is_cc = (cc_val >= 0.5).unsqueeze(-1).float()  # (B, max_pts, 1)
+            else:
+                is_cc = (cc_val < 0.0).unsqueeze(-1).float()   # (B, max_pts, 1)
             is_ncc = 1.0 - is_cc
             mu    = mu_ncc    * is_ncc + mu_cc    * is_cc
             sigma = sigma_ncc * is_ncc + sigma_cc * is_cc
@@ -2743,6 +3072,8 @@ def _oracle_cc_weights(model, batch, device) -> Optional[torch.Tensor]:
     cc_idx = core.cc_indicator_feature_idx
     tgt_x_raw = batch["tgt_x"].to(device)
     cc_val = tgt_x_raw[:, :, cc_idx]  # (B, max_pts)
+    if str(getattr(core, "cc_indicator_mode", "continuous")).lower() == "binary":
+        return (cc_val >= 0.5).float().unsqueeze(-1)  # (B, max_pts, 1)
     return (cc_val < 0.0).float().unsqueeze(-1)  # (B, max_pts, 1)
 
 
@@ -3293,6 +3624,93 @@ def make_arg_parser():
 
     p.add_argument("--train-frac", type=float, default=0.8)
     p.add_argument("--val-frac", type=float, default=0.1)
+    p.add_argument(
+        "--mass-stratified-split",
+        action="store_true",
+        help=(
+            "Use mass-stratified train/val/test splitting based on per-family median log10(M500c). "
+            "Disabled by default to preserve baseline behavior."
+        ),
+    )
+    p.add_argument(
+        "--mass-stratification-bins",
+        type=float,
+        nargs="+",
+        default=[12.0, 12.75, 13.25, 13.75, 14.25, 15.0],
+        help="Mass-bin edges for stratified split and weighted sampling (log10 M500c).",
+    )
+    p.add_argument(
+        "--use-mass-weighted-sampler",
+        action="store_true",
+        help=(
+            "Enable per-family weighted sampling in the training DataLoader using inverse mass-bin "
+            "frequency and optional high-mass boost."
+        ),
+    )
+    p.add_argument(
+        "--high-mass-threshold",
+        type=float,
+        default=13.8,
+        help="Families with median log10(M500c) >= this threshold receive high-mass boost when weighted sampling is enabled.",
+    )
+    p.add_argument(
+        "--high-mass-boost",
+        type=float,
+        default=2.0,
+        help="Multiplicative sampling boost for high-mass families when weighted sampling is enabled.",
+    )
+    p.add_argument(
+        "--mass-balance-power",
+        type=float,
+        default=1.0,
+        help="Exponent for inverse mass-bin frequency in weighted sampling (0 disables bin balancing).",
+    )
+    p.add_argument(
+        "--mass-quantile-idx",
+        type=int,
+        default=None,
+        help=(
+            "If set, train only on the N-th equal-count mass quantile (0-based). "
+            "Use together with --n-mass-quantiles to split data into N separate emulators. "
+            "Example: --mass-quantile-idx 2 --n-mass-quantiles 3 trains on the top third."
+        ),
+    )
+    p.add_argument(
+        "--n-mass-quantiles",
+        type=int,
+        default=3,
+        help="Number of equal-count mass quantiles when --mass-quantile-idx is used (default: 3).",
+    )
+    p.add_argument(
+        "--halo-mass-quantile-idx",
+        type=int,
+        default=None,
+        help=(
+            "Train only on halos in the N-th equal-count log10(M) quantile (0-based, halo-level). "
+            "Boundaries are computed from all individual halo masses so each emulator sees a "
+            "distinct, non-overlapping mass slice. "
+            "Example: --halo-mass-quantile-idx 2 --n-halo-mass-quantiles 3 trains on the top third "
+            "of halos by mass (~log10(M) > 12.9)."
+        ),
+    )
+    p.add_argument(
+        "--n-halo-mass-quantiles",
+        type=int,
+        default=3,
+        help="Number of equal-count halo-mass quantiles when --halo-mass-quantile-idx is used (default: 3).",
+    )
+    p.add_argument(
+        "--halo-logm-lo",
+        type=float,
+        default=None,
+        help="Hard lower bound on log10(M500c) per halo (inclusive). Alternative to --halo-mass-quantile-idx.",
+    )
+    p.add_argument(
+        "--halo-logm-hi",
+        type=float,
+        default=None,
+        help="Hard upper bound on log10(M500c) per halo (exclusive, except for the top slice). Alternative to --halo-mass-quantile-idx.",
+    )
 
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--num-workers", type=int, default=8)
@@ -3609,6 +4027,25 @@ def make_arg_parser():
             "blended using CCPredictor probabilities."
         ),
     )
+    p.add_argument(
+        "--cc-indicator-mode",
+        type=str,
+        default="continuous",
+        choices=["continuous", "binary"],
+        help=(
+            "Representation for the CC feature: 'continuous' uses log10(T_core/T500), "
+            "'binary' uses CC_tag in {0,1} (1=cool-core)."
+        ),
+    )
+    p.add_argument(
+        "--cc-binary-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Threshold on continuous log10(T_core/T500) used to define CC_tag when "
+            "--cc-indicator-mode=binary. Halos with indicator < threshold get CC_tag=1."
+        ),
+    )
 
     p.add_argument(
         "--temporal-holdout-snapnum",
@@ -3680,10 +4117,13 @@ def make_arg_parser():
 
 def main():
     args = make_arg_parser().parse_args()
+    args.cc_indicator_mode = str(getattr(args, "cc_indicator_mode", "continuous")).lower()
     if args.theta_start_idx < 2:
         raise ValueError("theta_start_idx must be >= 2 because x[...,0] and x[...,1] are reserved for mass/radius features")
     if getattr(args, "cc_dual_head", False) and not getattr(args, "cc_indicator", False):
         raise ValueError("--cc-dual-head requires --cc-indicator")
+    if args.cc_indicator_mode not in {"continuous", "binary"}:
+        raise ValueError("--cc-indicator-mode must be one of: continuous, binary")
     if str(args.decoder_likelihood).lower() == "student_t" and float(args.student_t_df) <= 2.0:
         raise ValueError("--student-t-df must be > 2.0 when --decoder-likelihood=student_t")
     if args.target_name == "all_profiles":
@@ -3763,7 +4203,13 @@ def main():
         dist.broadcast_object_list(obj, src=0)
         run_tag = str(obj[0])
     run_prefix = "mean" if args.training_stage == "mean_only" else "anp"
-    out_dir = out_root / f"{run_prefix}_{args.target_name}_{run_tag}"
+    if getattr(args, "halo_mass_quantile_idx", None) is not None:
+        quantile_tag = f"_hq{args.halo_mass_quantile_idx}of{args.n_halo_mass_quantiles}"
+    elif getattr(args, "mass_quantile_idx", None) is not None:
+        quantile_tag = f"_q{args.mass_quantile_idx}of{args.n_mass_quantiles}"
+    else:
+        quantile_tag = ""
+    out_dir = out_root / f"{run_prefix}_{args.target_name}{quantile_tag}_{run_tag}"
     if main_proc:
         out_dir.mkdir(parents=True, exist_ok=True)
     if ddp_enabled:
@@ -3773,7 +4219,105 @@ def main():
     if len(tasks) < 20:
         raise RuntimeError(f"Too few run families discovered ({len(tasks)}). Check file paths and filters.")
 
-    train_raw, val_raw, test_raw = split_tasks(tasks, train_frac=args.train_frac, val_frac=args.val_frac, seed=args.seed)
+    # --- Mass-quantile filtering (train separate emulator per mass slice) ---
+    if getattr(args, "mass_quantile_idx", None) is not None:
+        q_idx = int(args.mass_quantile_idx)
+        n_q = int(args.n_mass_quantiles)
+        tasks, q_lo, q_hi = filter_tasks_by_mass_quantile(tasks, n_quantiles=n_q, quantile_idx=q_idx)
+        if main_proc:
+            print(
+                f"[INFO] Mass-quantile filter: quantile {q_idx}/{n_q-1} "
+                f"(log10 M ∈ [{q_lo:.3f}, {q_hi:.3f}]), "
+                f"{len(tasks)} families retained"
+            )
+        if len(tasks) < 5:
+            raise RuntimeError(
+                f"Mass-quantile {q_idx} has only {len(tasks)} families after filtering. "
+                "Lower --n-mass-quantiles or check data coverage."
+            )
+        if main_proc:
+            import json as _json
+            _q_info = {
+                "quantile_idx": q_idx,
+                "n_quantiles": n_q,
+                "q_lo": float(q_lo),
+                "q_hi": float(q_hi),
+                "n_families": int(len(tasks)),
+                "proxy": "family_max_logm",
+            }
+            with open(out_dir / "quantile_info.json", "w") as _f:
+                _json.dump(_q_info, _f, indent=2)
+            del _json, _q_info, _f
+
+    # --- Halo-level mass filtering (distinct from family-level quantile above) ---
+    _halo_lo: Optional[float] = None
+    _halo_hi: Optional[float] = None
+    _halo_inclusive_hi = False
+    if getattr(args, "halo_mass_quantile_idx", None) is not None:
+        hq_idx = int(args.halo_mass_quantile_idx)
+        n_hq = int(args.n_halo_mass_quantiles)
+        halo_edges = compute_halo_mass_quantile_edges(tasks, n_quantiles=n_hq)
+        _halo_lo = float(halo_edges[hq_idx])
+        _halo_hi = float(halo_edges[hq_idx + 1])
+        _halo_inclusive_hi = (hq_idx == n_hq - 1)
+    elif getattr(args, "halo_logm_lo", None) is not None or getattr(args, "halo_logm_hi", None) is not None:
+        _halo_lo = float(args.halo_logm_lo) if args.halo_logm_lo is not None else float("-inf")
+        _halo_hi = float(args.halo_logm_hi) if args.halo_logm_hi is not None else float("inf")
+        _halo_inclusive_hi = True
+    if _halo_lo is not None:
+        n_halos_before = sum(s.n_halo for fam in tasks for s in fam.snapshots)
+        tasks = filter_halos_by_mass(
+            tasks,
+            logm_lo=_halo_lo,
+            logm_hi=_halo_hi if _halo_hi is not None else float("inf"),
+            inclusive_hi=_halo_inclusive_hi,
+            min_halos=max(2, int(getattr(args, "min_halos", 2))),
+        )
+        n_halos_after = sum(s.n_halo for fam in tasks for s in fam.snapshots)
+        if main_proc:
+            print(
+                f"[INFO] Halo-mass filter: log10(M) in "
+                f"[{_halo_lo:.3f}, {'inf' if _halo_hi is None else f'{_halo_hi:.3f}'}{']}' if not _halo_inclusive_hi else ']'} "
+                f"| halos: {n_halos_before:,} -> {n_halos_after:,} "
+                f"| families: {len(tasks)}"
+            )
+        if len(tasks) < 5:
+            raise RuntimeError(
+                f"Halo-mass filter left only {len(tasks)} families. "
+                "Widen --halo-logm-lo/hi or reduce --n-halo-mass-quantiles."
+            )
+        if main_proc:
+            import json as _json
+            _hq_info: dict = {
+                "q_lo": float(_halo_lo),
+                "q_hi": float(_halo_hi) if _halo_hi is not None else None,
+                "n_halos": int(n_halos_after),
+                "n_families": int(len(tasks)),
+                "proxy": "halo_individual_logm",
+            }
+            if getattr(args, "halo_mass_quantile_idx", None) is not None:
+                _hq_info["quantile_idx"] = int(args.halo_mass_quantile_idx)
+                _hq_info["n_quantiles"] = int(args.n_halo_mass_quantiles)
+                _hq_info["all_edges"] = [float(e) for e in halo_edges]
+            with open(out_dir / "quantile_info.json", "w") as _f:
+                _json.dump(_hq_info, _f, indent=2)
+            del _json, _hq_info, _f
+
+    if bool(getattr(args, "mass_stratified_split", False)):
+        train_raw, val_raw, test_raw = split_tasks_mass_stratified(
+            tasks,
+            train_frac=args.train_frac,
+            val_frac=args.val_frac,
+            seed=args.seed,
+            mass_bin_edges=args.mass_stratification_bins,
+        )
+    else:
+        train_raw, val_raw, test_raw = split_tasks(
+            tasks,
+            train_frac=args.train_frac,
+            val_frac=args.val_frac,
+            seed=args.seed,
+        )
     holdout_snap = int(args.temporal_holdout_snapnum)
     temporal_holdout_enabled = holdout_snap >= 0
     holdout_eval_raw: Optional[List[RunFamilyTask]] = None
@@ -3827,6 +4371,18 @@ def main():
             n_hold = 0 if holdout_eval_raw is None else sum(
                 1 for fam in holdout_eval_raw for s in fam.snapshots if int(s.snapnum) == holdout_snap
             )
+        if bool(getattr(args, "mass_stratified_split", False)):
+            all_mass = np.asarray([_family_mass_proxy_logm(f, use_max=True) for f in tasks], dtype=np.float64)
+            edges = _resolve_mass_bin_edges(args.mass_stratification_bins, all_mass)
+            tr_bins = _mass_bin_counts(train_raw, edges)
+            va_bins = _mass_bin_counts(val_raw, edges)
+            te_bins = _mass_bin_counts(test_raw, edges)
+            print("Mass-stratified split bins (family counts):")
+            for lbl in tr_bins.keys():
+                print(
+                    f"  {lbl}: train={tr_bins.get(lbl, 0)}, "
+                    f"val={va_bins.get(lbl, 0)}, test={te_bins.get(lbl, 0)}"
+                )
             print(
                 f"Temporal holdout enabled for snap {holdout_snap}: "
                 f"removed from train/val/test, holdout eval targets={n_hold} snapshots"
@@ -4044,18 +4600,30 @@ def main():
     cc_prior_stats: Optional[Dict[str, Any]] = None
     cc_predictor_model: Optional[CCPredictor] = None
     if args.cc_indicator:
-        cc_prior_stats = fit_cc_prior(train_raw, cc_feature_idx=int(args.cc_indicator_feature_idx))
+        cc_mode = str(getattr(args, "cc_indicator_mode", "continuous")).lower()
+        cc_prior_stats = fit_cc_prior(
+            train_raw,
+            cc_feature_idx=int(args.cc_indicator_feature_idx),
+            cc_mode=cc_mode,
+        )
         if main_proc:
-            print(
-                f"CC indicator prior fitted: global mean={cc_prior_stats['global_mean']:.3f}, "
-                f"std={cc_prior_stats['global_std']:.3f} from {cc_prior_stats['n_halos']} halos"
-            )
+            if cc_mode == "binary":
+                print(
+                    f"CC tag prior fitted: global p(CC)={cc_prior_stats['global_p_cc']:.3f} "
+                    f"from {cc_prior_stats['n_halos']} halos"
+                )
+            else:
+                print(
+                    f"CC indicator prior fitted: global mean={cc_prior_stats['global_mean']:.3f}, "
+                    f"std={cc_prior_stats['global_std']:.3f} from {cc_prior_stats['n_halos']} halos"
+                )
         # Train parameter-aware CC predictor f(logM, theta) -> (mu_cc, sigma_cc).
         if main_proc:
             print("Training parameter-aware CC predictor...")
         cc_predictor_model = train_cc_predictor(
             train_raw,
             cc_feature_idx=int(args.cc_indicator_feature_idx),
+            mode=cc_mode,
             theta_start_idx=int(args.theta_start_idx),
             theta_dim=int(args.theta_dim),
             hidden_dim=128,
@@ -4097,14 +4665,47 @@ def main():
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if ddp_enabled else None
     val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False) if ddp_enabled else None
     test_sampler = DistributedSampler(test_ds, num_replicas=world_size, rank=rank, shuffle=False) if ddp_enabled else None
+    train_weighted_sampler = None
+
+    if bool(getattr(args, "use_mass_weighted_sampler", False)):
+        if ddp_enabled:
+            if main_proc:
+                print("[WARN] --use-mass-weighted-sampler is currently disabled under DDP; using DistributedSampler.")
+        else:
+            w_np, fam_logm, edges = compute_mass_sampling_weights(
+                train_raw,
+                mass_bin_edges=args.mass_stratification_bins,
+                high_mass_threshold=float(args.high_mass_threshold),
+                high_mass_boost=float(args.high_mass_boost),
+                balance_power=float(args.mass_balance_power),
+            )
+            train_weighted_sampler = WeightedRandomSampler(
+                weights=torch.as_tensor(w_np, dtype=torch.double),
+                num_samples=len(train_ds),
+                replacement=True,
+            )
+            if main_proc:
+                hi_frac = float(np.mean(fam_logm >= float(args.high_mass_threshold))) if len(fam_logm) > 0 else 0.0
+                print(
+                    "Mass-weighted sampler enabled: "
+                    f"high_mass_threshold={args.high_mass_threshold:.2f}, "
+                    f"high_mass_boost={args.high_mass_boost:.3g}, "
+                    f"mass_balance_power={args.mass_balance_power:.3g}, "
+                    f"high_mass_family_frac={hi_frac:.2%}"
+                )
+                tr_bins = _mass_bin_counts(train_raw, edges)
+                print("Train family mass bins:")
+                for lbl, cnt in tr_bins.items():
+                    print(f"  {lbl}: {cnt}")
 
     loader_workers = int(args.ddp_num_workers) if ddp_enabled else int(args.num_workers)
+    active_train_sampler = train_sampler if train_sampler is not None else train_weighted_sampler
 
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
+        shuffle=(active_train_sampler is None),
+        sampler=active_train_sampler,
         num_workers=loader_workers,
         pin_memory=(device.type == "cuda"),
         collate_fn=collate_fn,
@@ -4205,6 +4806,7 @@ def main():
         ideal_gas_channel_indices=ideal_gas_channel_indices,
         cc_dual_head=bool(getattr(args, "cc_dual_head", False)),
         cc_indicator_feature_idx=int(getattr(args, "cc_indicator_feature_idx", -1)),
+        cc_indicator_mode=str(getattr(args, "cc_indicator_mode", "continuous")),
         decoder_likelihood=str(args.decoder_likelihood),
         student_t_df=float(args.student_t_df),
         context_dropout_rate=float(getattr(args, "context_dropout_rate", 0.0)),
