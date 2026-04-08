@@ -1,0 +1,340 @@
+{
+  "target_name": "all_profiles",
+  "training_stage": "full",
+  "n_tasks_total": 1009,
+  "n_train": 807,
+  "n_val": 100,
+  "n_test": 102,
+  "n_train_snapshots": 807,
+  "n_val_snapshots": 100,
+  "n_test_snapshots": 102,
+  "temporal_holdout": {
+    "enabled": false,
+    "snapnum": null,
+    "require_context": false,
+    "n_holdout_target_snapshots": 0,
+    "metrics": null,
+    "metrics_zeroshot": null
+  },
+  "select_metric": "weighted_orig",
+  "best_epoch": 259,
+  "best_score": 423124.1268020964,
+  "best_val_loss": 49.435058517456056,
+  "best_val_rmse_norm": 0.629166716337204,
+  "test": {
+    "rmse_original_units": 370173.26731004904,
+    "nll_original_units": -14.714889058879777,
+    "rmse_core_original_units": 892304.1419652505,
+    "rmse_outer_original_units": 45814.41316015902,
+    "per_target": {
+      "DM_density": {
+        "rmse_original_units": 920330.0,
+        "nll_original_units": 10.302743911743164,
+        "rmse_core_original_units": 2044220.375,
+        "rmse_outer_original_units": 118532.59375
+      },
+      "stellar_density": {
+        "rmse_original_units": 531513.125,
+        "nll_original_units": 6.382293224334717,
+        "rmse_core_original_units": 1173778.625,
+        "rmse_outer_original_units": 24484.884765625
+      },
+      "gas_density": {
+        "rmse_original_units": 0.0,
+        "nll_original_units": -63.38258743286133,
+        "rmse_core_original_units": 0.0,
+        "rmse_outer_original_units": 0.0
+      },
+      "temperature": {
+        "rmse_original_units": 0.36772897839546204,
+        "nll_original_units": -1.0079569816589355,
+        "rmse_core_original_units": 0.6979352831840515,
+        "rmse_outer_original_units": 0.2184489518404007
+      },
+      "pressure": {
+        "rmse_original_units": 1.449809592382247e-22,
+        "nll_original_units": -55.238868713378906,
+        "rmse_core_original_units": 3.1319466730700066e-22,
+        "rmse_outer_original_units": 5.293955920339377e-23
+      },
+      "metallicity": {
+        "rmse_original_units": 0.17247095704078674,
+        "nll_original_units": -1.7557123899459839,
+        "rmse_core_original_units": 0.3044002056121826,
+        "rmse_outer_original_units": 0.11874978244304657
+      },
+      "Mstar": {
+        "rmse_original_units": 11.08452033996582,
+        "nll_original_units": 1.858070731163025,
+        "rmse_core_original_units": 11.134255409240723,
+        "rmse_outer_original_units": 11.072052001953125
+      }
+    },
+    "per_snapshot": {
+      "90": {
+        "rmse_original_units": 401318.12698167295,
+        "n_points": 1928427
+      }
+    }
+  },
+  "test_zeroshot": {
+    "rmse_original_units": 393354.17999387253,
+    "nll_original_units": -14.49581682915781,
+    "rmse_core_original_units": 943917.4505489481,
+    "rmse_outer_original_units": 45025.960193135616,
+    "per_target": {
+      "DM_density": {
+        "rmse_original_units": 957237.4375,
+        "nll_original_units": 10.325967788696289,
+        "rmse_core_original_units": 2127916.25,
+        "rmse_outer_original_units": 115638.6015625
+      },
+      "stellar_density": {
+        "rmse_original_units": 588699.875,
+        "nll_original_units": 6.478030204772949,
+        "rmse_core_original_units": 1299996.75,
+        "rmse_outer_original_units": 27985.6484375
+      },
+      "gas_density": {
+        "rmse_original_units": 0.0,
+        "nll_original_units": -62.90217208862305,
+        "rmse_core_original_units": 0.0,
+        "rmse_outer_original_units": 0.0
+      },
+      "temperature": {
+        "rmse_original_units": 0.36719632148742676,
+        "nll_original_units": -0.8486084938049316,
+        "rmse_core_original_units": 0.6891195774078369,
+        "rmse_outer_original_units": 0.2242138534784317
+      },
+      "pressure": {
+        "rmse_original_units": 1.400649042946322e-22,
+        "nll_original_units": -54.986934661865234,
+        "rmse_core_original_units": 2.994713653207373e-22,
+        "rmse_outer_original_units": 3.743392066509216e-23
+      },
+      "metallicity": {
+        "rmse_original_units": 0.19683992862701416,
+        "nll_original_units": -1.5162370204925537,
+        "rmse_core_original_units": 0.3490918278694153,
+        "rmse_outer_original_units": 0.13444936275482178
+      },
+      "Mstar": {
+        "rmse_original_units": 14.524782180786133,
+        "nll_original_units": 2.0626778602600098,
+        "rmse_core_original_units": 14.289163589477539,
+        "rmse_outer_original_units": 14.583091735839844
+      }
+    },
+    "per_snapshot": {
+      "90": {
+        "rmse_original_units": 424228.5753218939,
+        "n_points": 1928427
+      }
+    }
+  },
+  "coverage": {
+    "1sigma": 0.6623657519833522,
+    "2sigma": 0.9261584700898712
+  },
+  "fewshot_rmse": {
+    "1": 377801.6676879085,
+    "2": 376839.2838031046,
+    "5": 373147.3057598039,
+    "10": 373426.497753268
+  },
+  "fewshot_rel_improvement_pct": {
+    "1": 0.0,
+    "2": 0.2547325666118855,
+    "5": 1.2319590743441178,
+    "10": 1.1580599845987787
+  },
+  "mean_prior": {
+    "enabled": true,
+    "source": "trained",
+    "checkpoint": "anp_training_runs/anp_all_profiles_20260406_203048/mean_model.pt",
+    "hidden_dim": 128,
+    "epochs": 80,
+    "lr": 0.001,
+    "weight_decay": 0.001,
+    "metrics": {
+      "train": {
+        "rmse_original_units": 1949411.4432616567,
+        "rmse_core_original_units": 4356695.470413996,
+        "rmse_outer_original_units": 67480.0505508016,
+        "per_target": {
+          "DM_density": {
+            "rmse_original_units": 1867643.8427883857,
+            "rmse_core_original_units": 4163842.2165696505,
+            "rmse_outer_original_units": 160378.93645924938
+          },
+          "stellar_density": {
+            "rmse_original_units": 4850895.387791469,
+            "rmse_core_original_units": 10725769.415734801,
+            "rmse_outer_original_units": 78734.19058998188
+          },
+          "gas_density": {
+            "rmse_original_units": 0.0,
+            "rmse_core_original_units": 0.0,
+            "rmse_outer_original_units": 0.0
+          },
+          "temperature": {
+            "rmse_original_units": 0.3335426528341593,
+            "rmse_core_original_units": 0.5616111704115845,
+            "rmse_outer_original_units": 0.24607069229748463
+          },
+          "pressure": {
+            "rmse_original_units": 3.413673944442691e-22,
+            "rmse_core_original_units": 7.588364908373038e-22,
+            "rmse_outer_original_units": 4.969407417481006e-23
+          },
+          "metallicity": {
+            "rmse_original_units": 0.38359910877965686,
+            "rmse_core_original_units": 0.6551561481844947,
+            "rmse_outer_original_units": 0.27766274675387764
+          },
+          "Mstar": {
+            "rmse_original_units": 19.318691523260718,
+            "rmse_core_original_units": 19.168609020929573,
+            "rmse_outer_original_units": 19.35603032040187
+          }
+        },
+        "per_snapshot": {
+          "90": {
+            "rmse_original_units": 1949411.4432616567,
+            "n_points": 15904366
+          }
+        },
+        "n_tasks": 807
+      },
+      "val": {
+        "rmse_original_units": 2454322.010243553,
+        "rmse_core_original_units": 5486141.538990118,
+        "rmse_outer_original_units": 75261.30719944814,
+        "per_target": {
+          "DM_density": {
+            "rmse_original_units": 1918452.6346772292,
+            "rmse_core_original_units": 4276538.071343391,
+            "rmse_outer_original_units": 168467.1198265184
+          },
+          "stellar_density": {
+            "rmse_original_units": 6251703.63798683,
+            "rmse_core_original_units": 13844292.468872868,
+            "rmse_outer_original_units": 106793.78305213759
+          },
+          "gas_density": {
+            "rmse_original_units": 0.0,
+            "rmse_core_original_units": 0.0,
+            "rmse_outer_original_units": 0.0
+          },
+          "temperature": {
+            "rmse_original_units": 0.3506597038962698,
+            "rmse_core_original_units": 0.5590716844993042,
+            "rmse_outer_original_units": 0.27540936012941336
+          },
+          "pressure": {
+            "rmse_original_units": 1.4760771804324087e-22,
+            "rmse_core_original_units": 3.189321785936754e-22,
+            "rmse_outer_original_units": 4.389704416182229e-23
+          },
+          "metallicity": {
+            "rmse_original_units": 0.3489377428788025,
+            "rmse_core_original_units": 0.5808493028511165,
+            "rmse_outer_original_units": 0.26110876812217665
+          },
+          "Mstar": {
+            "rmse_original_units": 19.860386763794825,
+            "rmse_core_original_units": 19.685552552491927,
+            "rmse_outer_original_units": 19.90385535983331
+          }
+        },
+        "per_snapshot": {
+          "90": {
+            "rmse_original_units": 2454322.010243553,
+            "n_points": 1924373
+          }
+        },
+        "n_tasks": 100
+      },
+      "test": {
+        "rmse_original_units": 1929209.280309511,
+        "rmse_core_original_units": 4309792.5820042705,
+        "rmse_outer_original_units": 69030.65651513617,
+        "per_target": {
+          "DM_density": {
+            "rmse_original_units": 1911831.8655948434,
+            "rmse_core_original_units": 4262343.882375017,
+            "rmse_outer_original_units": 164263.5381784072
+          },
+          "stellar_density": {
+            "rmse_original_units": 4777355.961865825,
+            "rmse_core_original_units": 10557910.170872724,
+            "rmse_outer_original_units": 80136.63642162985
+          },
+          "gas_density": {
+            "rmse_original_units": 0.0,
+            "rmse_core_original_units": 0.0,
+            "rmse_outer_original_units": 0.0
+          },
+          "temperature": {
+            "rmse_original_units": 0.3134006304504676,
+            "rmse_core_original_units": 0.5299004868021616,
+            "rmse_outer_original_units": 0.22982365732520157
+          },
+          "pressure": {
+            "rmse_original_units": 7.297795707559759e-23,
+            "rmse_core_original_units": 1.544247646566481e-22,
+            "rmse_outer_original_units": 2.683442522788727e-23
+          },
+          "metallicity": {
+            "rmse_original_units": 0.302198472715267,
+            "rmse_core_original_units": 0.5249785507125908,
+            "rmse_outer_original_units": 0.21330527811899647
+          },
+          "Mstar": {
+            "rmse_original_units": 19.884285403559428,
+            "rmse_core_original_units": 19.784101622331587,
+            "rmse_outer_original_units": 19.909252579192223
+          }
+        },
+        "per_snapshot": {
+          "90": {
+            "rmse_original_units": 1929209.2803095109,
+            "n_points": 1928427
+          }
+        },
+        "n_tasks": 102
+      }
+    }
+  },
+  "normalization": {
+    "y_mean": [
+      -0.07584600895643234,
+      -0.4405097961425781,
+      -0.16696316003799438,
+      0.0006237503257580101,
+      -0.15263646841049194,
+      0.049868352711200714,
+      0.028062492609024048
+    ],
+    "y_std": [
+      0.2115686684846878,
+      0.7771749496459961,
+      0.40138524770736694,
+      0.376669704914093,
+      0.49317628145217896,
+      0.5646805167198181,
+      0.5052929520606995
+    ]
+  },
+  "target_names": [
+    "DM_density",
+    "stellar_density",
+    "gas_density",
+    "temperature",
+    "pressure",
+    "metallicity",
+    "Mstar"
+  ],
+  "checkpoint": "anp_training_runs/anp_all_profiles_20260406_203048/best_model.pt"
+}
