@@ -216,6 +216,8 @@ class Emulator:
                     cc_indicator_mode=str(args.get("cc_indicator_mode", "continuous")),
                     decoder_likelihood=str(args.get("decoder_likelihood", "gaussian")),
                     student_t_df=float(args.get("student_t_df", 5.0)),
+                    disable_film=bool(args.get("disable_film", False)),
+                    disable_anp=bool(args.get("disable_anp", False)),
                 )
                 # Backward compat: inject default y_std_buf for checkpoints
                 # saved before the ideal-gas penalty was introduced.

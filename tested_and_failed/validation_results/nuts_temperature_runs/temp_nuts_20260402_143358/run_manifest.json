@@ -1,0 +1,55 @@
+[
+  {
+    "free_set": "6",
+    "out_file": "validation_results/nuts_temperature_runs/temp_nuts_20260402_143358/temp_only_free6_chains.npz",
+    "fit_idxs": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "fit_param_names": [
+      "Omega0",
+      "sigma8",
+      "WindEnergyIn1e51erg",
+      "RadioFeedbackFactor",
+      "VariableWindVelFactor",
+      "RadioFeedbackReiorientationFactor"
+    ],
+    "n_halos": 16,
+    "batch_names": [
+      "CID28",
+      "A0496",
+      "A3570",
+      "CID36",
+      "A3390",
+      "A3733",
+      "NGC6107",
+      "A1185",
+      "AWM5",
+      "NGC7556",
+      "NGC1650",
+      "ZWCL1665",
+      "A0076",
+      "A0576",
+      "A2657",
+      "A3341"
+    ],
+    "chain_seconds": [
+      1428.5928256511688,
+      1502.3019335269928,
+      1839.329600572586,
+      1466.9404776096344
+    ],
+    "rhat_by_param_index": {
+      "0": 0.9999324495483926,
+      "1": 0.999958969371143,
+      "2": 1.0000111413426604,
+      "3": 0.9999775317781223,
+      "4": 0.9999214701146175,
+      "5": 0.9999596594788135
+    }
+  }
+]

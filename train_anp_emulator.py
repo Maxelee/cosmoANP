@@ -60,6 +60,10 @@ ALL_PROFILE_TARGETS = [
     "hot_radial_gas_velocity_dispersion",
     "hot_rotational_gas_velocity",
     "hot_gas_velocity_dispersion",
+    "Mstar",
+    "entropy",
+    "hot_entropy",
+    "compton_y_proxy",
 ]
 
 # Positive-definite channels that should be modeled in log10 space for
@@ -72,10 +76,14 @@ ALL_PROFILE_LOG_TARGETS = {
     "temperature",
     "pressure",
     "metallicity",
+    "Mstar",
     "hot_gas_density",
     "hot_temperature",
     "hot_pressure",
     "hot_metallicity",
+    "entropy",
+    "hot_entropy",
+    "compton_y_proxy",
 }
 
 TARGET_CHOICES = SINGLE_TARGET_CHOICES + ["all_profiles"]
@@ -1247,10 +1255,15 @@ def select_target(
     rho = npz_data["gas_density_array"].astype(np.float32)
     temp = npz_data["temperature_array"].astype(np.float32)
 
+    n_r = npz_data["gas_density_array"].shape[1]
+    mstar_1d = npz_data["Mstar"].astype(np.float32)
+    mstar_2d = np.broadcast_to(mstar_1d[:, None], (mstar_1d.shape[0], n_r)).copy()
+
     target_map = {
         "potential": npz_data["potential_array"].astype(np.float32),
         "DM_density": npz_data["DM_density_array"].astype(np.float32),
         "stellar_density": npz_data["stellar_density_array"].astype(np.float32),
+        "Mstar": mstar_2d,
         "gas_density": npz_data["gas_density_array"].astype(np.float32),
         "temperature": npz_data["temperature_array"].astype(np.float32),
         "pressure": npz_data["pressure_array"].astype(np.float32),
@@ -1267,14 +1280,27 @@ def select_target(
         "hot_radial_gas_velocity_dispersion": npz_data["hot_radial_gas_velocity_dispersion_array"].astype(np.float32),
         "hot_rotational_gas_velocity": npz_data["hot_rotational_gas_velocity_array"].astype(np.float32),
         "hot_gas_velocity_dispersion": npz_data["hot_gas_velocity_dispersion_array"].astype(np.float32),
+    }
+
+    # Derived channels computed from base profiles.
+    n_e = rho / (mu_e * mp)
+    hot_rho = npz_data["hot_gas_density_array"].astype(np.float32)
+    hot_temp = npz_data["hot_temperature_array"].astype(np.float32)
+    hot_n_e = hot_rho / (mu_e * mp)
+    # Entropy: K = T * n_e^{-2/3}  (keV cm^2 convention)
+    target_map["entropy"] = np.clip(temp, eps, None) * np.clip(n_e, eps, None) ** (-2.0 / 3.0)
+    target_map["hot_entropy"] = np.clip(hot_temp, eps, None) * np.clip(hot_n_e, eps, None) ** (-2.0 / 3.0)
+    # Compton-y proxy: proportional to n_e * T (thermal pressure integral proxy)
+    target_map["compton_y_proxy"] = np.clip(n_e * temp, eps, None)
+
+    target_map.update({
         "log_pressure": np.log10(np.clip(npz_data["pressure_array"].astype(np.float32), eps, None)),
         "log_gas_density": np.log10(np.clip(rho, eps, None)),
         "log_temperature": np.log10(np.clip(temp, eps, None)),
         "log_metallicity": np.log10(np.clip(npz_data["metallicity_array"].astype(np.float32), eps, None)),
-    }
+    })
 
     if target_name == "xsb_proxy":
-        n_e = rho / (mu_e * mp)
         sx_proxy = np.clip(n_e**2 * np.sqrt(np.clip(temp, 1e-6, None)), eps, None)
         y = np.log10(sx_proxy).astype(np.float32)
         return y, np.ones_like(y, dtype=np.bool_)
@@ -2289,6 +2315,7 @@ class Decoder(nn.Module):
         theta_start_idx: int,
         theta_film_scale: float,
         cc_dual_head: bool = False,
+        disable_film: bool = False,
     ):
         super().__init__()
         self.y_dim = y_dim
@@ -2296,12 +2323,14 @@ class Decoder(nn.Module):
         self.theta_start_idx = theta_start_idx
         self.theta_film_scale = theta_film_scale
         self.cc_dual_head = cc_dual_head
+        self.disable_film = disable_film
         self.trunk = DeepMLP(x_dim + d_model + d_latent, hidden_dim=hidden_dim, out_dim=hidden_dim, n_layers=n_layers, dropout=dropout)
-        self.theta_film = nn.Sequential(
-            nn.Linear(theta_dim, hidden_dim * 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-        )
+        if not disable_film:
+            self.theta_film = nn.Sequential(
+                nn.Linear(theta_dim, hidden_dim * 2),
+                nn.SiLU(),
+                nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            )
         # Default (NCC) head — also used when cc_dual_head is False.
         self.mu = nn.Linear(hidden_dim, y_dim)
         self.log_sigma = nn.Linear(hidden_dim, y_dim)
@@ -2316,12 +2345,13 @@ class Decoder(nn.Module):
         z_exp = z.unsqueeze(1).expand(-1, nt, -1)
         h = self.trunk(torch.cat([tgt_x, r, z_exp], dim=-1))
 
-        # Condition decoder features directly on run-level theta via FiLM.
-        theta = tgt_x[:, 0, self.theta_start_idx : self.theta_start_idx + self.theta_dim]
-        film = self.theta_film(theta)
-        gamma, beta = film.chunk(2, dim=-1)
-        h = h * (1.0 + self.theta_film_scale * torch.tanh(gamma).unsqueeze(1))
-        h = h + self.theta_film_scale * beta.unsqueeze(1)
+        if not self.disable_film:
+            # Condition decoder features directly on run-level theta via FiLM.
+            theta = tgt_x[:, 0, self.theta_start_idx : self.theta_start_idx + self.theta_dim]
+            film = self.theta_film(theta)
+            gamma, beta = film.chunk(2, dim=-1)
+            h = h * (1.0 + self.theta_film_scale * torch.tanh(gamma).unsqueeze(1))
+            h = h + self.theta_film_scale * beta.unsqueeze(1)
         return h
 
     @staticmethod
@@ -2394,6 +2424,8 @@ class StrongANP(nn.Module):
         stratified_mass_bins: int = 4,
         stratified_radius_bins: int = 4,
         stratified_min_points: int = 16,
+        disable_film: bool = False,
+        disable_anp: bool = False,
     ):
         super().__init__()
 
@@ -2436,12 +2468,20 @@ class StrongANP(nn.Module):
             theta_start_idx_model += self.radius_fourier_extra_dim
 
         theta_dim = max(1, x_dim - theta_start_idx_model)
-        self.latent = LatentEncoder(x_dim, y_dim, d_model, d_latent, n_heads, n_latent_layers, dropout)
-        self.det = DeterministicPath(x_dim, y_dim, d_model, n_heads, n_ctx_layers, dropout)
+        self.disable_anp = bool(disable_anp)
+        self.disable_film = bool(disable_film)
+        dec_d_model = 0 if self.disable_anp else d_model
+        dec_d_latent = 0 if self.disable_anp else d_latent
+        if not self.disable_anp:
+            self.latent = LatentEncoder(x_dim, y_dim, d_model, d_latent, n_heads, n_latent_layers, dropout)
+            self.det = DeterministicPath(x_dim, y_dim, d_model, n_heads, n_ctx_layers, dropout)
+        else:
+            self.latent = None  # type: ignore[assignment]
+            self.det = None  # type: ignore[assignment]
         self.dec = Decoder(
             x_dim,
-            d_model,
-            d_latent,
+            dec_d_model,
+            dec_d_latent,
             hidden_dim=dec_hidden,
             n_layers=dec_layers,
             dropout=dropout,
@@ -2450,6 +2490,7 @@ class StrongANP(nn.Module):
             theta_start_idx=theta_start_idx_model,
             theta_film_scale=theta_film_scale,
             cc_dual_head=cc_dual_head,
+            disable_film=disable_film,
         )
         self.cc_dual_head = bool(cc_dual_head)
         self.cc_indicator_feature_idx = int(cc_indicator_feature_idx)
@@ -2643,17 +2684,24 @@ class StrongANP(nn.Module):
                 keep[b, first_valid[b]] = True
             ctx_mask = ctx_mask & keep
 
-        q_ctx = self.latent(ctx_x, ctx_y, ctx_mask)
-        lat_x, lat_y, lat_mask = self._subsample_masked_points(
-            tgt_x,
-            tgt_y,
-            tgt_mask,
-            max_points=self.max_latent_points,
-        )
-        q_all = self.latent(lat_x, lat_y, lat_mask)
-        z = q_all.rsample()
+        if self.disable_anp:
+            # No latent/det paths: decoder sees only tgt_x.
+            bsz, nt = tgt_x.shape[:2]
+            r = tgt_x.new_zeros(bsz, nt, 0)
+            z = tgt_x.new_zeros(bsz, 0)
+            q_ctx = q_all = None
+        else:
+            q_ctx = self.latent(ctx_x, ctx_y, ctx_mask)
+            lat_x, lat_y, lat_mask = self._subsample_masked_points(
+                tgt_x,
+                tgt_y,
+                tgt_mask,
+                max_points=self.max_latent_points,
+            )
+            q_all = self.latent(lat_x, lat_y, lat_mask)
+            z = q_all.rsample()
 
-        r = self.det(ctx_x, ctx_y, ctx_mask, tgt_x, tgt_mask)
+            r = self.det(ctx_x, ctx_y, ctx_mask, tgt_x, tgt_mask)
 
         # ---- Dual-head CC/NCC routing ----
         if self.cc_dual_head:
@@ -2751,10 +2799,13 @@ class StrongANP(nn.Module):
 
         # Free bits: clamp per-dimension KL to a minimum to prevent
         # posterior collapse (Kingma et al. 2016).
-        kl_per_dim = kl_divergence(q_all, q_ctx)  # (batch, d_latent)
-        if self.free_bits > 0:
-            kl_per_dim = torch.clamp(kl_per_dim, min=self.free_bits)
-        kl = kl_per_dim.sum(dim=1).mean()
+        if self.disable_anp or q_all is None or q_ctx is None:
+            kl = torch.zeros((), device=mu.device, dtype=mu.dtype)
+        else:
+            kl_per_dim = kl_divergence(q_all, q_ctx)  # (batch, d_latent)
+            if self.free_bits > 0:
+                kl_per_dim = torch.clamp(kl_per_dim, min=self.free_bits)
+            kl = kl_per_dim.sum(dim=1).mean()
         mse = (resid_sq * channel_w * weighted_mask_3d).sum() / denom
 
         # Calibrate predicted variance against residual variance at each valid point.
@@ -2896,6 +2947,17 @@ class StrongANP(nn.Module):
 
         ctx_x = self._fuse_time(self._embed_x(ctx_x_raw), ctx_snap)
         tgt_x = self._fuse_time(self._embed_x(tgt_x_raw), tgt_snap)
+
+        if self.disable_anp:
+            bsz, nt = tgt_x.shape[:2]
+            r = tgt_x.new_zeros(bsz, nt, 0)
+            z = tgt_x.new_zeros(bsz, 0)
+            mu, sig = self.dec(tgt_x, r, z)
+            # No latent → no epistemic uncertainty.
+            aleatoric_var = self._aleatoric_var_from_scale(sig)
+            epistemic_var = torch.zeros_like(aleatoric_var)
+            total_std = aleatoric_var.sqrt()
+            return mu, total_std, aleatoric_var.sqrt(), epistemic_var.sqrt()
 
         q_ctx = self.latent(ctx_x, ctx_y, ctx_mask)
         r = self.det(ctx_x, ctx_y, ctx_mask, tgt_x, tgt_mask)
@@ -3776,6 +3838,8 @@ def make_arg_parser():
     p.add_argument("--radius-fourier-n-freq", type=int, default=16)
     p.add_argument("--radius-fourier-scale", type=float, default=2.0)
     p.add_argument("--disable-radius-fourier", action="store_true")
+    p.add_argument("--disable-film", action="store_true", help="Disable FiLM conditioning in the decoder (ablation).")
+    p.add_argument("--disable-anp", action="store_true", help="Disable latent + deterministic ANP paths; decoder sees only tgt_x (ablation).")
     p.add_argument("--n-heads", type=int, default=8)
     p.add_argument("--n-latent-layers", type=int, default=3)
     p.add_argument("--n-ctx-layers", type=int, default=3)
@@ -4818,6 +4882,8 @@ def main():
         stratified_mass_bins=int(getattr(args, "stratified_mass_bins", 4)),
         stratified_radius_bins=int(getattr(args, "stratified_radius_bins", 4)),
         stratified_min_points=int(getattr(args, "stratified_min_points", 16)),
+        disable_film=bool(getattr(args, "disable_film", False)),
+        disable_anp=bool(getattr(args, "disable_anp", False)),
     ).to(device)
 
     # Populate the y_std buffer so the ideal-gas penalty can convert normalised

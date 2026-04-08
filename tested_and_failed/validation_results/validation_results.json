@@ -1,0 +1,137 @@
+{
+  "duality": {
+    "temperature": {
+      "mean_max_rel_err": 1.1914713837768431e-07,
+      "mean_median_rel_err": 0.0,
+      "std_max_rel_err": 0.0,
+      "std_median_rel_err": 0.0
+    },
+    "pressure": {
+      "mean_max_rel_err": 1.1916672804090922e-07,
+      "mean_median_rel_err": 0.0,
+      "std_max_rel_err": 0.0,
+      "std_median_rel_err": 0.0
+    },
+    "gas_density": {
+      "mean_max_rel_err": 1.1913451913869721e-07,
+      "mean_median_rel_err": 0.0,
+      "std_max_rel_err": 0.0,
+      "std_median_rel_err": 0.0
+    },
+    "metallicity": {
+      "mean_max_rel_err": 1.19118936936502e-07,
+      "mean_median_rel_err": 0.0,
+      "std_max_rel_err": 0.0,
+      "std_median_rel_err": 0.0
+    },
+    "duality_pass": true
+  },
+  "context_bias": {
+    "context_influence": {
+      "temperature": {
+        "max_shift_dex": 28.606597900390625,
+        "mean_shift_dex": 27.271961212158203
+      },
+      "pressure": {
+        "max_shift_dex": 26.1104736328125,
+        "mean_shift_dex": 24.01702308654785
+      },
+      "gas_density": {
+        "max_shift_dex": 3.7314300537109375,
+        "mean_shift_dex": 3.2736575603485107
+      },
+      "metallicity": {
+        "max_shift_dex": 0.2856481075286865,
+        "mean_shift_dex": 0.18453966081142426
+      }
+    },
+    "null_context_test": {
+      "masked": {
+        "available": false,
+        "per_field": {},
+        "error": "Expected parameter loc (Tensor of shape (1, 96)) of distribution Normal(loc: torch.Size([1, 96]), scale: torch.Size([1, 96])) to satisfy the constraint Real(), but found invalid values:\ntensor([[nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan,\n         nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan,\n         nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan,\n         nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan]],\n       device='cuda:0')"
+      },
+      "learned": {
+        "available": false
+      }
+    },
+    "ood_mean_reversion": {
+      "temperature": {
+        "mean_reversion_score": -1.9057232211555786,
+        "n_tail": 35542,
+        "has_bias": true
+      },
+      "pressure": {
+        "mean_reversion_score": -0.5412252272288525,
+        "n_tail": 35762,
+        "has_bias": true
+      },
+      "gas_density": {
+        "mean_reversion_score": -0.697910570111467,
+        "n_tail": 37067,
+        "has_bias": true
+      },
+      "metallicity": {
+        "mean_reversion_score": -1.6220699825221612,
+        "n_tail": 35621,
+        "has_bias": true
+      }
+    },
+    "context_matters": true,
+    "ood_bias_detected": true
+  },
+  "4": {
+    "rhat_pass": false,
+    "rhat_max": 185886.84419979228,
+    "recovery_coverage_68": 0.6,
+    "recovery_coverage_95": 0.7,
+    "recovery_pass": true,
+    "coverage_68_per_param": {
+      "Omega0": 0.0,
+      "sigma8": 0.0,
+      "WindEnergyIn1e51erg": 1.0,
+      "RadioFeedbackFactor": 1.0,
+      "VariableWindVelFactor": 1.0,
+      "RadioFeedbackReiorientationFactor": 1.0,
+      "OmegaBaryon": 0.0,
+      "HubbleParam": 0.0,
+      "n_s": 1.0,
+      "MaxSfrTimescale": 1.0
+    },
+    "n_mock": 1,
+    "mock_details": [
+      {
+        "run_id": 533,
+        "mass_bin": "[13.0,14.0)",
+        "n_stack": 12,
+        "mean_mass": 31954758008832.0,
+        "mass_bias_dex_best": -0.1,
+        "mass_bias_scan": [
+          {
+            "bias_dex": -0.1,
+            "logprob_mean": -17.643228372694914,
+            "logprior": -0.5,
+            "objective": -18.143228372694914
+          },
+          {
+            "bias_dex": 0.0,
+            "logprob_mean": -149.64314987789163,
+            "logprior": -0.0,
+            "objective": -149.64314987789163
+          },
+          {
+            "bias_dex": 0.1,
+            "logprob_mean": -540.3362479998059,
+            "logprior": -0.5,
+            "objective": -540.8362479998059
+          }
+        ],
+        "rhat_max": 185886.84419979228,
+        "accept_rate": 0.6840909090909091
+      }
+    ],
+    "kl_bound": 930.7812564887414,
+    "rmse_over_sigma": 3.9386572510792335,
+    "kl_criterion": 0.12909944487358055
+  }
+}
